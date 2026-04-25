@@ -53,6 +53,10 @@ public final class SignetSDK {
     /// before encoding or saving. The buffer must be kCVPixelFormatType_32BGRA
     /// or kCVPixelFormatType_24RGB.
     ///
+    /// TODO: hardware attestation required for production. The device's public key
+    /// certificate must be obtained from the Secure Enclave and passed to the C API
+    /// so that verifiers can confirm the stamp came from a hardware-backed key.
+    ///
     /// Returns true if the stamp was applied, false if no beacon is cached yet.
     @discardableResult
     public func stamp(pixelBuffer: CVPixelBuffer) -> Bool {

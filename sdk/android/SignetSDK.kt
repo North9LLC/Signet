@@ -66,6 +66,10 @@ object SignetSDK {
      * Call this inside your photo capture pipeline, before encoding or saving.
      * The bitmap must be in ARGB_8888 format (Android default).
      *
+     * TODO: hardware attestation required for production. The device's public key
+     * certificate must be obtained from StrongBox and passed to the C API
+     * so that verifiers can confirm the stamp came from a hardware-backed key.
+     *
      * Returns true if the stamp was applied. Returns false if no beacon is
      * cached yet (call start() before opening the camera).
      */

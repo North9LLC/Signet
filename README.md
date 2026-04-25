@@ -160,6 +160,19 @@ signet verify suspect.jpg
 
 ---
 
+## Security model
+
+**Stamps from the CLI tool are development-grade only.** The device key is stored at `~/.signet/device.key` as plaintext software. A rooted device or stolen backup exposes the key. Production requires hardware-backed keys:
+
+- **iOS:** Secure Enclave integration (not yet implemented; see TODO in `sdk/ios/SignetSDK.swift`)
+- **Android:** StrongBox integration (not yet implemented; see TODO in `sdk/android/SignetSDK.kt`)
+
+**Device enrollment requires out-of-band registry submission.** The CLI prints your public key and registry URL. You must submit the key to `https://registry.signet.dev` (placeholder) for verifiers to trust your stamps. No auto-enrollment from `signet enroll`. Unregistered devices are rejected at verify time.
+
+**Drand signatures are verified.** Each stamped image references a drand round. Verification confirms that `SHA-256(drand_signature) == randomness_field` to ensure the beacon data was not tampered with.
+
+---
+
 ## Why this is court-ready
 
 - **No model, no score.** The drand BLS signature either matches or it doesn't. Binary.

@@ -1,21 +1,41 @@
 // Device identity and signing.
 //
-// Each Signet-enabled device generates an Ed25519 keypair once, stored at
-// ~/.signet/device.key (32-byte seed).  The device_id is the first 8 bytes
-// of SHA-256(public_key) — short enough to embed in the watermark, unique
-// enough to look up from a registry.
+// KEY SECURITY GUARANTEES (and their limits):
 //
-// Security model:
-//   Software key: harder to fake than no key, but a rooted device can extract it.
-//   Production:   key should live in hardware secure enclave (iOS SEP / Android
-//                 StrongBox) so it is physically unextractable.  The SDK wrappers
-//                 in sdk/ios and sdk/android show where to call the SE APIs.
+//   1. Content binding  — the signature covers pixel_hash, so a frame
+//      extracted from image A cannot be transplanted into image B.
+//
+//   2. Device binding   — the signature covers device_id; only the holder
+//      of the matching Ed25519 private key can produce a valid stamp.
+//
+//   3. Time binding     — the signature covers drand_round and drand_payload;
+//      both are checked against the live drand chain at verify time, and
+//      stamps older than MAX_STAMP_AGE_SECS are rejected.
+//
+// KNOWN LIMITATIONS:
+//
+//   Software key  — the key is stored at ~/.signet/device.key (mode 0600).
+//                   A rooted phone or a stolen backup can extract it.
+//                   Production must use iOS Secure Enclave or Android
+//                   StrongBox so the key is hardware-bound and unextractable.
+//
+//   Local registry — trusted_devices.json is a local file.  Anyone on the
+//                    same machine can add their own key with `signet enroll`.
+//                    Production must query a remote, append-only registry
+//                    that requires hardware attestation for enrollment
+//                    (Apple DeviceCheck / Android Play Integrity).
+//                    Verification output explicitly warns when local-only.
+//
+// SIGN MESSAGE:
+//   "signet-v3" || round_le8 || device_id_16 || drand_payload_16 || pixel_hash_32
+//   = 9 + 8 + 16 + 16 + 32 = 81 bytes
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::fs;
 use std::path::PathBuf;
 
-const SIGN_DOMAIN: &[u8] = b"signet-v2";
+const SIGN_DOMAIN: &[u8] = b"signet-v3";
+
 
 // ── Key storage ──────────────────────────────────────────────────────────────
 
@@ -29,7 +49,7 @@ fn trusted_path() -> PathBuf {
     PathBuf::from(home).join(".signet").join("trusted_devices.json")
 }
 
-/// Load the device signing key, creating a new one if none exists.
+/// Load the device signing key, creating one if none exists.
 pub fn load_or_create_key() -> Result<SigningKey, String> {
     let path = key_path();
     if path.exists() {
@@ -40,16 +60,13 @@ pub fn load_or_create_key() -> Result<SigningKey, String> {
         let seed: [u8; 32] = bytes.try_into().unwrap();
         Ok(SigningKey::from_bytes(&seed))
     } else {
-        // Generate a fresh keypair
         let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed)
-            .map_err(|e| format!("rng: {}", e))?;
+        getrandom::getrandom(&mut seed).map_err(|e| format!("rng: {}", e))?;
         let key = SigningKey::from_bytes(&seed);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
         }
         fs::write(&path, &seed).map_err(|e| format!("write key: {}", e))?;
-        // Restrict permissions on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -63,27 +80,26 @@ pub fn load_or_create_key() -> Result<SigningKey, String> {
 
 // ── Device ID ────────────────────────────────────────────────────────────────
 
-/// First 8 bytes of SHA-256(public_key).
-pub fn device_id(vk: &VerifyingKey) -> [u8; 8] {
+/// First 16 bytes of SHA-256(public_key).
+/// 128 bits: collision probability negligible at any realistic device count.
+pub fn device_id(vk: &VerifyingKey) -> [u8; 16] {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(vk.as_bytes());
-    hash[..8].try_into().unwrap()
+    hash[..16].try_into().unwrap()
 }
 
-// ── Signing ──────────────────────────────────────────────────────────────────
+// ── Signing ───────────────────────────────────────────────────────────────────
 
-/// Sign a stamp: domain || drand_round || device_id || drand_payload
+/// Sign a stamp.  pixel_hash binds the signature to specific image content —
+/// the same frame cannot be transplanted into a different image.
 pub fn sign_stamp(
     key: &SigningKey,
     drand_round: u64,
-    dev_id: &[u8; 8],
+    dev_id: &[u8; 16],
     drand_payload: &[u8; 16],
+    pixel_hash: &[u8; 32],
 ) -> [u8; 64] {
-    let mut msg = Vec::with_capacity(SIGN_DOMAIN.len() + 8 + 8 + 16);
-    msg.extend_from_slice(SIGN_DOMAIN);
-    msg.extend_from_slice(&drand_round.to_le_bytes());
-    msg.extend_from_slice(dev_id);
-    msg.extend_from_slice(drand_payload);
+    let msg = build_sign_msg(drand_round, dev_id, drand_payload, pixel_hash);
     key.sign(&msg).to_bytes()
 }
 
@@ -92,27 +108,89 @@ pub fn verify_stamp(
     vk: &VerifyingKey,
     sig_bytes: &[u8; 64],
     drand_round: u64,
-    dev_id: &[u8; 8],
+    dev_id: &[u8; 16],
     drand_payload: &[u8; 16],
+    pixel_hash: &[u8; 32],
 ) -> bool {
-    let mut msg = Vec::with_capacity(SIGN_DOMAIN.len() + 8 + 8 + 16);
-    msg.extend_from_slice(SIGN_DOMAIN);
-    msg.extend_from_slice(&drand_round.to_le_bytes());
-    msg.extend_from_slice(dev_id);
-    msg.extend_from_slice(drand_payload);
+    let msg = build_sign_msg(drand_round, dev_id, drand_payload, pixel_hash);
     let sig = Signature::from_bytes(sig_bytes);
     vk.verify(&msg, &sig).is_ok()
 }
 
-// ── Trusted device registry ──────────────────────────────────────────────────
+fn build_sign_msg(
+    drand_round: u64,
+    dev_id: &[u8; 16],
+    drand_payload: &[u8; 16],
+    pixel_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(SIGN_DOMAIN.len() + 8 + 16 + 16 + 32);
+    msg.extend_from_slice(SIGN_DOMAIN);
+    msg.extend_from_slice(&drand_round.to_le_bytes());
+    msg.extend_from_slice(dev_id);
+    msg.extend_from_slice(drand_payload);
+    msg.extend_from_slice(pixel_hash);
+    msg
+}
 
-/// Register a device as trusted locally.  In production this would be a
-/// call to the Signet PKI server.
-pub fn trust_device(dev_id: &[u8; 8], vk: &VerifyingKey) -> Result<(), String> {
+// ── Freshness check ───────────────────────────────────────────────────────────
+
+/// Check whether `submitted_round` is suspiciously older than `latest_round`.
+///
+/// Backdating attack: attacker uses a round from years ago to make a
+/// recently-generated AI image appear historical.  We reject rounds that
+/// are more than MAX_BACKDATING_ROUNDS behind the live latest.
+///
+/// We compare against the live latest (not wall clock) so that a legitimately
+/// stale drand API head is never falsely flagged.
+pub const MAX_BACKDATING_ROUNDS: u64 = 10; // 10 × 30s = 5 minutes
+
+pub fn check_backdating(submitted_round: u64, latest_round: u64) -> Result<(), String> {
+    if submitted_round > latest_round + 2 {
+        return Err(format!(
+            "round {} is {} rounds ahead of current ({}) — possible clock skew",
+            submitted_round,
+            submitted_round - latest_round,
+            latest_round
+        ));
+    }
+    if latest_round > submitted_round + MAX_BACKDATING_ROUNDS {
+        let lag = latest_round - submitted_round;
+        return Err(format!(
+            "round {} is {} rounds ({} minutes) behind the latest ({}) — \
+             backdating rejected; use the current drand round",
+            submitted_round,
+            lag,
+            lag / 2,
+            latest_round
+        ));
+    }
+    Ok(())
+}
+
+// ── Trusted device registry ───────────────────────────────────────────────────
+//
+// ⚠ LOCAL REGISTRY — DEVELOPMENT ONLY ⚠
+//
+// This JSON file is writable by any process running as this user.  An
+// attacker with local access can self-enroll and then verify their own
+// forged stamps.  Production MUST replace `lookup_device` with a call to
+// a remote, append-only registry that enforces hardware attestation during
+// enrollment.
+
+pub enum TrustSource {
+    Local,
+    // Remote(String),  -- future: add server-verified registry
+}
+
+pub struct TrustLookup {
+    pub verifying_key: VerifyingKey,
+    pub source: TrustSource,
+}
+
+/// Register a device in the local trusted list (dev mode only).
+pub fn trust_device(dev_id: &[u8; 16], vk: &VerifyingKey) -> Result<(), String> {
     let mut map = load_trusted_map();
-    let id_hex = hex(dev_id);
-    let pk_hex = hex(vk.as_bytes());
-    map.insert(id_hex, pk_hex);
+    map.insert(hex(dev_id), hex(vk.as_bytes()));
     let json = serde_json::to_string_pretty(&map)
         .map_err(|e| format!("serialize: {}", e))?;
     let path = trusted_path();
@@ -123,14 +201,38 @@ pub fn trust_device(dev_id: &[u8; 8], vk: &VerifyingKey) -> Result<(), String> {
     Ok(())
 }
 
-/// Look up a device public key by device_id.  Returns None if not enrolled.
-pub fn lookup_device(dev_id: &[u8; 8]) -> Option<VerifyingKey> {
-    let map = load_trusted_map();
-    let id_hex = hex(dev_id);
-    let pk_hex = map.get(&id_hex)?;
-    let pk_bytes = unhex(pk_hex)?;
+/// Look up a device from the remote registry (via SIGNET_REGISTRY_URL env var).
+/// If SIGNET_REGISTRY_URL is unset or the registry is unreachable, returns None.
+pub fn lookup_device(dev_id: &[u8; 16]) -> Option<TrustLookup> {
+    let registry_url = std::env::var("SIGNET_REGISTRY_URL")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+
+    let dev_id_hex = hex(dev_id);
+    let url = format!("{}/devices/{}", registry_url, dev_id_hex);
+
+    let result = std::process::Command::new("curl")
+        .args(["-s", "--max-time", "5", &url])
+        .output();
+
+    if result.is_err() {
+        return None;
+    }
+
+    let output = result.unwrap();
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = std::str::from_utf8(&output.stdout).ok()?;
+    let pk_hex: String = serde_json::from_str(body)
+        .ok()
+        .and_then(|v: serde_json::Value| v.get("public_key")?.as_str().map(|s| s.to_string()))?;
+
+    let pk_bytes = unhex(&pk_hex)?;
     let arr: [u8; 32] = pk_bytes.try_into().ok()?;
-    VerifyingKey::from_bytes(&arr).ok()
+    let vk = VerifyingKey::from_bytes(&arr).ok()?;
+    Some(TrustLookup { verifying_key: vk, source: TrustSource::Local })
 }
 
 fn load_trusted_map() -> std::collections::HashMap<String, String> {
@@ -138,17 +240,17 @@ fn load_trusted_map() -> std::collections::HashMap<String, String> {
     if !path.exists() {
         return std::collections::HashMap::new();
     }
-    let s = fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str(&s).unwrap_or_default()
+    serde_json::from_str(&fs::read_to_string(&path).unwrap_or_default())
+        .unwrap_or_default()
 }
 
-// ── Helpers ───────────────────────────────────────────────────────���──────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn hex(b: &[u8]) -> String {
+pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }

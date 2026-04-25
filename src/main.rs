@@ -65,17 +65,20 @@ fn cmd_enroll() {
     };
     let vk = signing_key.verifying_key();
     let dev_id = device::device_id(&vk);
-    // Register self as locally trusted
-    if let Err(e) = device::trust_device(&dev_id, &vk) {
-        eprintln!("failed to register local trust: {}", e);
-        std::process::exit(1);
-    }
+
+    eprintln!("⚠  WARNING: Key stored at ~/.signet/device.key is software-only.");
+    eprintln!("   For production court-grade use, key must be in Secure Enclave (iOS) or StrongBox (Android).");
+    eprintln!("   Stamps from this device are development-grade only.");
+    eprintln!();
+
     println!("device enrolled");
     println!("  device_id : {}", hex(&dev_id));
     println!("  public_key: {}", hex(vk.as_bytes()));
     println!();
-    println!("Submit the public_key to the Signet registry so verifiers can confirm");
+    println!("Submit the public_key to the Signet registry out-of-band so verifiers can confirm");
     println!("your stamps are from a trusted device.");
+    println!("Registry URL: {}",
+        std::env::var("SIGNET_REGISTRY_URL").unwrap_or_else(|_| "https://registry.signet.dev".into()));
 }
 
 fn cmd_stamp(args: &[String]) {
@@ -98,32 +101,57 @@ fn cmd_stamp(args: &[String]) {
         format!("{}_stamped.png", stem)
     };
 
-    // Fetch drand (or accept --sig override for testing)
-    let (drand_round, sig_hex) = if let Some(pos) = args.iter().position(|a| a == "--sig") {
-        let sig = args.get(pos + 1).cloned().unwrap_or_else(|| {
-            eprintln!("--sig requires a value");
-            std::process::exit(2);
-        });
-        // When --sig is given we also need --round
-        let round = args.iter().position(|a| a == "--round")
-            .and_then(|p| args.get(p + 1))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        (round, sig)
-    } else {
-        println!("fetching latest drand round...");
-        match drand::fetch_latest() {
-            Ok(r) => {
-                let ts = drand::round_to_unix(r.round);
-                println!("  round={} time={} UTC", r.round, unix_to_utc(ts));
-                (r.round, r.signature_hex)
+    // Fetch drand — always use the live current round.
+    // --sig/--round flags are accepted only for test/dev and trigger a warning.
+    let (drand_round, sig_hex, is_test_override) =
+        if let Some(pos) = args.iter().position(|a| a == "--sig") {
+            let sig = args.get(pos + 1).cloned().unwrap_or_else(|| {
+                eprintln!("--sig requires a value");
+                std::process::exit(2);
+            });
+            let round = args.iter().position(|a| a == "--round")
+                .and_then(|p| args.get(p + 1))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            (round, sig, true)
+        } else {
+            println!("fetching latest drand round...");
+            match drand::fetch_latest() {
+                Ok(r) => {
+                    let ts = drand::round_to_unix(r.round);
+                    println!("  round={} time={} UTC", r.round, unix_to_utc(ts));
+                    (r.round, r.signature_hex, false)
+                }
+                Err(e) => {
+                    eprintln!("drand fetch failed: {}", e);
+                    std::process::exit(1);
+                }
             }
+        };
+
+    // Backdating check: reject rounds significantly behind the live latest.
+    // Prevents stamping an AI image with a historical drand round to fake an old timestamp.
+    // When --sig is used (test/dev mode), fetch the latest round for comparison.
+    {
+        let latest_round = match drand::fetch_latest() {
+            Ok(r) => r.round,
             Err(e) => {
-                eprintln!("drand fetch failed: {}", e);
+                eprintln!("could not fetch latest drand round for backdating check: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = device::check_backdating(drand_round, latest_round) {
+            if is_test_override {
+                eprintln!("⚠  WARNING (test override): {}", e);
+            } else {
+                eprintln!("stamp rejected: {}", e);
                 std::process::exit(1);
             }
         }
-    };
+        if is_test_override {
+            eprintln!("⚠  WARNING: --sig override is for testing only; production must use live fetch");
+        }
+    }
 
     let pay16 = match payload::derive_from_drand_signature(&sig_hex) {
         Ok(p) => p,
@@ -133,20 +161,7 @@ fn cmd_stamp(args: &[String]) {
         }
     };
 
-    // Load device key and sign
-    let signing_key = match device::load_or_create_key() {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("device key error: {} — run `signet enroll` first", e);
-            std::process::exit(1);
-        }
-    };
-    let vk = signing_key.verifying_key();
-    let dev_id = device::device_id(&vk);
-    let sig_bytes = device::sign_stamp(&signing_key, drand_round, &dev_id, &pay16);
-    let frame = imgwm::build_frame(drand_round, &pay16, &dev_id, &sig_bytes);
-
-    // Load, embed, save
+    // Load image first so we can compute the pixel commitment before signing.
     let img = match image::open(in_path) {
         Ok(i) => i,
         Err(e) => {
@@ -157,8 +172,25 @@ fn cmd_stamp(args: &[String]) {
     let mut rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
     let npixels = (width * height) as usize;
-    let pixels = rgb.as_mut();
 
+    // Pixel commitment: SHA-256 of pixels with all blue LSBs zeroed.
+    // Binds the signature to this specific image — frame cannot be transplanted.
+    let pix_hash = imgwm::pixel_commitment(rgb.as_raw());
+
+    // Load device key and sign (including pixel commitment).
+    let signing_key = match device::load_or_create_key() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("device key error: {} — run `signet enroll` first", e);
+            std::process::exit(1);
+        }
+    };
+    let vk = signing_key.verifying_key();
+    let dev_id = device::device_id(&vk);
+    let sig_bytes = device::sign_stamp(&signing_key, drand_round, &dev_id, &pay16, &pix_hash);
+    let frame = imgwm::build_frame(drand_round, &pay16, &dev_id, &sig_bytes);
+
+    let pixels = rgb.as_mut();
     if let Err(e) = imgwm::embed(pixels, npixels, &frame) {
         eprintln!("embed failed: {}", e);
         std::process::exit(1);
@@ -172,19 +204,24 @@ fn cmd_stamp(args: &[String]) {
     println!("  device_id : {}", hex(&dev_id));
     println!("  drand_round: {}", drand_round);
     println!("  payload   : {}", hex(&pay16));
+    println!("  pixel_hash : {}", hex(&pix_hash));
+}
+
+fn fail_verify(json_mode: bool, reason: &str) -> ! {
+    if json_mode {
+        // Escape the reason for JSON
+        let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
+        println!("{{\"verified\":false,\"error\":\"{}\"}}", escaped);
+    } else {
+        println!("NOT VERIFIED: {}", reason);
+    }
+    std::process::exit(1);
 }
 
 fn cmd_verify_image(in_path: &str, _specific_round: Option<u64>, json_mode: bool) {
     let img = match image::open(in_path) {
         Ok(i) => i,
-        Err(e) => {
-            if json_mode {
-                println!("{{\"verified\":false,\"error\":\"open failed: {}\"}}", e);
-            } else {
-                eprintln!("failed to open image {}: {}", in_path, e);
-            }
-            std::process::exit(1);
-        }
+        Err(e) => fail_verify(json_mode, &format!("open failed: {}", e)),
     };
 
     let rgb = img.to_rgb8();
@@ -192,92 +229,81 @@ fn cmd_verify_image(in_path: &str, _specific_round: Option<u64>, json_mode: bool
     let npixels = (width * height) as usize;
     let pixels = rgb.as_raw();
 
-    // Extract 96-byte frame
+    // ── Step 1: extract frame ─────────────────────────────────────────────────
     let raw_frame = match imgwm::extract(pixels, npixels) {
         Ok(f) => f,
-        Err(e) => {
-            if json_mode {
-                println!("{{\"verified\":false,\"error\":\"extract failed: {}\"}}", e);
-            } else {
-                eprintln!("extract failed: {}", e);
-            }
-            std::process::exit(1);
-        }
+        Err(e) => fail_verify(json_mode, &format!("extract failed: {}", e)),
     };
     let parsed = imgwm::parse_frame(&raw_frame);
 
-    // 1. Check device signature — this is what prevents faking
-    let vk = match device::lookup_device(&parsed.device_id) {
-        Some(k) => k,
-        None => {
-            let msg = format!(
-                "unknown device {} — not in trusted registry",
-                hex(&parsed.device_id)
-            );
-            if json_mode {
-                println!("{{\"verified\":false,\"error\":\"{}\"}}", msg);
-            } else {
-                println!("NOT VERIFIED: {}", msg);
-            }
-            std::process::exit(1);
-        }
+    // ── Step 2: device lookup (registry check) ────────────────────────────────
+    // An unenrolled device cannot produce a stamp that passes here.
+    // ⚠ LOCAL REGISTRY: see device.rs — production requires remote PKI.
+    let trust = match device::lookup_device(&parsed.device_id) {
+        Some(t) => t,
+        None => fail_verify(
+            json_mode,
+            &format!(
+                "device {} not in trusted registry (local dev registry only — \
+                 production requires remote PKI)",
+                device::hex(&parsed.device_id)
+            ),
+        ),
     };
-    if !device::verify_stamp(&vk, &parsed.signature, parsed.drand_round,
-                              &parsed.device_id, &parsed.drand_payload) {
-        if json_mode {
-            println!("{{\"verified\":false,\"error\":\"device signature invalid\"}}");
-        } else {
-            println!("NOT VERIFIED: device signature invalid");
-        }
-        std::process::exit(1);
+
+    // ── Step 4: recompute pixel commitment and verify Ed25519 signature ───────
+    // The signature covers pixel_hash, so this also proves the image content
+    // has not been modified and that this frame was not transplanted from another
+    // image.
+    let pix_hash = imgwm::pixel_commitment(pixels);
+    if !device::verify_stamp(
+        &trust.verifying_key,
+        &parsed.signature,
+        parsed.drand_round,
+        &parsed.device_id,
+        &parsed.drand_payload,
+        &pix_hash,
+    ) {
+        fail_verify(
+            json_mode,
+            "signature invalid — image content may have been modified, or \
+             frame was transplanted from a different image",
+        );
     }
 
-    // 2. Verify drand payload against the chain
+    // ── Step 5: verify drand payload against live chain ───────────────────────
     let round_data = match drand::fetch_round(parsed.drand_round) {
         Ok(r) => r,
-        Err(e) => {
-            if json_mode {
-                println!("{{\"verified\":false,\"error\":\"drand fetch failed: {}\"}}", e);
-            } else {
-                eprintln!("drand fetch failed: {}", e);
-            }
-            std::process::exit(1);
-        }
+        Err(e) => fail_verify(json_mode, &format!("drand fetch failed: {}", e)),
     };
     let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
         Ok(p) => p,
-        Err(_) => {
-            if json_mode {
-                println!("{{\"verified\":false,\"error\":\"payload derivation failed\"}}");
-            } else {
-                println!("NOT VERIFIED: payload derivation failed");
-            }
-            std::process::exit(1);
-        }
+        Err(_) => fail_verify(json_mode, "drand payload derivation failed"),
     };
     if expected != parsed.drand_payload {
-        if json_mode {
-            println!("{{\"verified\":false,\"error\":\"drand payload mismatch — image may be tampered\"}}");
-        } else {
-            println!("NOT VERIFIED: drand payload mismatch — image may be tampered");
-        }
-        std::process::exit(1);
+        fail_verify(json_mode, "drand payload mismatch — round number may be forged");
     }
 
-    // Both checks pass
+    // ── All checks passed ─────────────────────────────────────────────────────
     let ts = drand::round_to_unix(parsed.drand_round);
+    let registry_note = match trust.source {
+        device::TrustSource::Local =>
+            " [⚠ local registry — dev mode only; production needs remote PKI]",
+    };
+
     if json_mode {
         println!(
-            "{{\"verified\":true,\"round\":{},\"time\":\"{}\",\"device_id\":\"{}\"}}",
+            "{{\"verified\":true,\"round\":{},\"time\":\"{}\",\"device_id\":\"{}\",\
+             \"registry\":\"local\"}}",
             parsed.drand_round,
             unix_to_utc(ts),
-            hex(&parsed.device_id)
+            device::hex(&parsed.device_id)
         );
     } else {
-        println!("VERIFIED");
+        println!("VERIFIED{}", registry_note);
         println!("  time     : {} UTC", unix_to_utc(ts));
         println!("  round    : {}", parsed.drand_round);
-        println!("  device_id: {}", hex(&parsed.device_id));
+        println!("  device_id: {}", device::hex(&parsed.device_id));
     }
 }
 

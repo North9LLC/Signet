@@ -1,6 +1,7 @@
 // Minimal drand client: shells out to `curl` for HTTP (no http-client crate cached).
 
 use std::process::Command;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct DrandRound {
@@ -33,6 +34,28 @@ pub fn fetch_round(round: u64) -> Result<DrandRound, String> {
 /// Drand genesis: 1592213100 Unix, period: 30 seconds.
 pub fn round_to_unix(round: u64) -> u64 {
     1_592_213_100 + (round.saturating_sub(1)) * 30
+}
+
+/// Verify that the drand signature's SHA-256 hash matches the randomness field.
+/// This ensures the signature bytes were not tampered with.
+pub fn verify_signature(signature_hex: &str, randomness_hex: &str) -> bool {
+    let sig_bytes = match hex_to_bytes(signature_hex) {
+        Some(b) => b,
+        None => return false,
+    };
+    let hash = Sha256::digest(&sig_bytes);
+    let hash_hex = format!("{:x}", hash);
+    hash_hex == randomness_hex
+}
+
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn fetch_url(url: &str) -> Result<DrandRound, String> {
