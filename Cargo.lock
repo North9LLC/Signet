@@ -197,8 +197,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "signet-fsk-proto"
-version = "0.0.1"
+name = "signet"
+version = "0.1.0"
 dependencies = [
  "rand",
  "serde",
