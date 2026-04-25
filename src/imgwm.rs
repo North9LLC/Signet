@@ -1,20 +1,69 @@
-// Invisible spread-spectrum watermark for images.
+// Image watermark — spread-spectrum LSB across the blue channel.
 //
-// The 20-byte RS payload is spread as LSBs across the blue channel of every
-// pixel.  Bit b occupies pixel indices b, b+160, b+320, … so a 12 MP image
-// gives ~75 000 votes per bit.  Majority-vote extraction survives JPEG at
-// quality ≥ 80 and moderate cropping (>30% of pixels must survive).
+// Frame format (96 bytes = 768 bits):
+//   [0-7]   drand_round  u64 LE
+//   [8-23]  drand_payload  16 bytes  (HKDF of drand signature)
+//   [24-31] device_id    8 bytes   (SHA-256(pubkey)[0..8])
+//   [32-95] Ed25519 signature  64 bytes
+//           signs: "signet-v2" || round_le8 || device_id || drand_payload
 //
-// Binary outcome: either the embedded payload RS-decodes and matches a known
-// drand round, or it does not.  No probability — just pass or fail.
+// Robustness: each bit is spread across every 768th pixel.
+// A 12 MP image gives ~15 600 votes per bit.  Majority-vote extraction
+// survives JPEG compression and moderate editing.
+//
+// Security: without the device private key you cannot produce a valid
+// Ed25519 signature, so you cannot fake a stamp from a device you do
+// not control.  Production deployments should store the key in hardware
+// (iOS Secure Enclave / Android StrongBox).
 
-const BITS: usize = 160; // 20 bytes × 8 bits
+pub const FRAME_BYTES: usize = 96;
+const BITS: usize = FRAME_BYTES * 8; // 768
 
-// ── bit packing helpers ─────────────────────────────────────────────────────
+// ── Frame encoding ───────────────────────────────────────────────────────────
 
-fn payload_to_bits(payload: &[u8; 20]) -> [u8; BITS] {
+pub fn build_frame(
+    drand_round: u64,
+    drand_payload: &[u8; 16],
+    device_id: &[u8; 8],
+    sig: &[u8; 64],
+) -> [u8; FRAME_BYTES] {
+    let mut frame = [0u8; FRAME_BYTES];
+    frame[0..8].copy_from_slice(&drand_round.to_le_bytes());
+    frame[8..24].copy_from_slice(drand_payload);
+    frame[24..32].copy_from_slice(device_id);
+    frame[32..96].copy_from_slice(sig);
+    frame
+}
+
+pub struct ParsedFrame {
+    pub drand_round: u64,
+    pub drand_payload: [u8; 16],
+    pub device_id: [u8; 8],
+    pub signature: [u8; 64],
+}
+
+pub fn parse_frame(frame: &[u8; FRAME_BYTES]) -> ParsedFrame {
+    let mut round_bytes = [0u8; 8];
+    round_bytes.copy_from_slice(&frame[0..8]);
+    let drand_round = u64::from_le_bytes(round_bytes);
+
+    let mut drand_payload = [0u8; 16];
+    drand_payload.copy_from_slice(&frame[8..24]);
+
+    let mut device_id = [0u8; 8];
+    device_id.copy_from_slice(&frame[24..32]);
+
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&frame[32..96]);
+
+    ParsedFrame { drand_round, drand_payload, device_id, signature }
+}
+
+// ── Bit packing ───────────────────────────────────────────────────────────────
+
+fn frame_to_bits(frame: &[u8; FRAME_BYTES]) -> [u8; BITS] {
     let mut bits = [0u8; BITS];
-    for (i, &byte) in payload.iter().enumerate() {
+    for (i, &byte) in frame.iter().enumerate() {
         for b in 0..8 {
             bits[i * 8 + b] = (byte >> (7 - b)) & 1;
         }
@@ -22,30 +71,29 @@ fn payload_to_bits(payload: &[u8; 20]) -> [u8; BITS] {
     bits
 }
 
-fn bits_to_payload(bits: &[u8; BITS]) -> [u8; 20] {
-    let mut out = [0u8; 20];
-    for (i, byte) in out.iter_mut().enumerate() {
+fn bits_to_frame(bits: &[u8; BITS]) -> [u8; FRAME_BYTES] {
+    let mut frame = [0u8; FRAME_BYTES];
+    for (i, byte) in frame.iter_mut().enumerate() {
         for b in 0..8 {
             *byte |= bits[i * 8 + b] << (7 - b);
         }
     }
-    out
+    frame
 }
 
-// ── public API ───────────────────────────────────────────────────────────────
+// ── Embed / extract ───────────────────────────────────────────────────────────
 
-/// Embed `payload` into flat RGB pixels (3 bytes per pixel).
-/// Modifies pixels in-place.  Image must have ≥ 1 600 pixels (trivially true
-/// for any real photo).
-pub fn embed(pixels: &mut [u8], npixels: usize, payload: &[u8; 20]) -> Result<(), String> {
-    if npixels < BITS * 10 {
+/// Embed a 96-byte frame into the blue-channel LSBs of flat RGB pixels.
+/// pixels: [R0,G0,B0, R1,G1,B1, ...], 3 bytes per pixel.
+pub fn embed(pixels: &mut [u8], npixels: usize, frame: &[u8; FRAME_BYTES]) -> Result<(), String> {
+    if npixels < BITS * 8 {
         return Err(format!(
             "image too small: need ≥ {} pixels, got {}",
-            BITS * 10,
+            BITS * 8,
             npixels
         ));
     }
-    let bits = payload_to_bits(payload);
+    let bits = frame_to_bits(frame);
     for (bit_idx, &bit) in bits.iter().enumerate() {
         let mut pos = bit_idx;
         while pos < npixels {
@@ -56,13 +104,12 @@ pub fn embed(pixels: &mut [u8], npixels: usize, payload: &[u8; 20]) -> Result<()
     Ok(())
 }
 
-/// Extract payload by majority-vote over blue-channel LSBs.
-/// Returns the 20-byte raw codeword; caller must RS-decode and verify.
-pub fn extract(pixels: &[u8], npixels: usize) -> Result<[u8; 20], String> {
-    if npixels < BITS * 10 {
+/// Extract a 96-byte frame by majority-vote over blue-channel LSBs.
+pub fn extract(pixels: &[u8], npixels: usize) -> Result<[u8; FRAME_BYTES], String> {
+    if npixels < BITS * 8 {
         return Err(format!(
             "image too small: need ≥ {} pixels, got {}",
-            BITS * 10,
+            BITS * 8,
             npixels
         ));
     }
@@ -81,5 +128,5 @@ pub fn extract(pixels: &[u8], npixels: usize) -> Result<[u8; 20], String> {
         }
         bits[bit_idx] = if votes_1 > votes_0 { 1 } else { 0 };
     }
-    Ok(bits_to_payload(&bits))
+    Ok(bits_to_frame(&bits))
 }

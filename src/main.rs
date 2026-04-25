@@ -1,22 +1,29 @@
 // signet CLI. Subcommands:
-//   stamp <in.jpg|png> [--out <out.png>] [--sig <hex>]   embed beacon watermark into an image
-//   verify <in.jpg|png|wav> [--round <N>] [--json]       verify image or WAV watermark
-//   generate <out.wav> [--sig <hex>]                     encode beacon into a WAV file
-//   decode <in.wav> [--json]                             decode a WAV file and print the payload
-//   roundtrip                                            in-memory encode + decode smoke test
-//   sweep                                                BER matrix across SNR / bandpass / reverb
+//   enroll                                               generate device key + register as trusted
+//   stamp <in.jpg|png> [--out <out.png>] [--sig <hex>]  embed beacon watermark into an image
+//   verify <in.jpg|png|wav> [--round <N>] [--json]      verify image or WAV watermark
+//   generate <out.wav> [--sig <hex>]                    encode beacon into a WAV file
+//   decode <in.wav> [--json]                            decode a WAV file and print the payload
+//   roundtrip                                           in-memory encode + decode smoke test
+//   sweep                                               BER matrix across SNR / bandpass / reverb
 
-use signet::{channel, drand, fec, imgwm, modem, payload, wav};
+use signet::{channel, device, drand, fec, imgwm, modem, payload, wav};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn usage() -> ! {
-    eprintln!("usage: signet <stamp|verify|generate|decode|roundtrip|sweep> [args...]");
+    eprintln!("usage: signet <enroll|stamp|verify|generate|decode|roundtrip|sweep> [args...]");
+    eprintln!();
+    eprintln!("  enroll");
+    eprintln!("      Generate this device's Ed25519 keypair (if not already created),");
+    eprintln!("      register it as locally trusted, and print the public key.");
+    eprintln!("      Submit the public key to the Signet registry to make your stamps");
+    eprintln!("      verifiable by others.");
     eprintln!();
     eprintln!("  stamp <in.jpg|png> [--out <out.png>] [--sig <hex>]");
-    eprintln!("      Embed an invisible drand watermark into an image.");
+    eprintln!("      Embed an invisible drand watermark + device signature into an image.");
     eprintln!("      Output is always PNG (lossless) so the watermark is preserved.");
     eprintln!("      --out sets the output path (default: <stem>_stamped.png).");
     eprintln!();
@@ -48,6 +55,29 @@ fn is_image_path(path: &str) -> bool {
         || lower.ends_with(".webp")
 }
 
+fn cmd_enroll() {
+    let signing_key = match device::load_or_create_key() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("key error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let vk = signing_key.verifying_key();
+    let dev_id = device::device_id(&vk);
+    // Register self as locally trusted
+    if let Err(e) = device::trust_device(&dev_id, &vk) {
+        eprintln!("failed to register local trust: {}", e);
+        std::process::exit(1);
+    }
+    println!("device enrolled");
+    println!("  device_id : {}", hex(&dev_id));
+    println!("  public_key: {}", hex(vk.as_bytes()));
+    println!();
+    println!("Submit the public_key to the Signet registry so verifiers can confirm");
+    println!("your stamps are from a trusted device.");
+}
+
 fn cmd_stamp(args: &[String]) {
     if args.is_empty() {
         usage();
@@ -68,22 +98,25 @@ fn cmd_stamp(args: &[String]) {
         format!("{}_stamped.png", stem)
     };
 
-    let sig_hex = if let Some(pos) = args.iter().position(|a| a == "--sig") {
-        args.get(pos + 1).cloned().unwrap_or_else(|| {
+    // Fetch drand (or accept --sig override for testing)
+    let (drand_round, sig_hex) = if let Some(pos) = args.iter().position(|a| a == "--sig") {
+        let sig = args.get(pos + 1).cloned().unwrap_or_else(|| {
             eprintln!("--sig requires a value");
             std::process::exit(2);
-        })
+        });
+        // When --sig is given we also need --round
+        let round = args.iter().position(|a| a == "--round")
+            .and_then(|p| args.get(p + 1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        (round, sig)
     } else {
         println!("fetching latest drand round...");
         match drand::fetch_latest() {
             Ok(r) => {
                 let ts = drand::round_to_unix(r.round);
-                println!(
-                    "  round={} time={} UTC",
-                    r.round,
-                    unix_to_utc(ts)
-                );
-                r.signature_hex
+                println!("  round={} time={} UTC", r.round, unix_to_utc(ts));
+                (r.round, r.signature_hex)
             }
             Err(e) => {
                 eprintln!("drand fetch failed: {}", e);
@@ -99,8 +132,21 @@ fn cmd_stamp(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let pay20 = fec::rs_encode(&pay16);
 
+    // Load device key and sign
+    let signing_key = match device::load_or_create_key() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("device key error: {} — run `signet enroll` first", e);
+            std::process::exit(1);
+        }
+    };
+    let vk = signing_key.verifying_key();
+    let dev_id = device::device_id(&vk);
+    let sig_bytes = device::sign_stamp(&signing_key, drand_round, &dev_id, &pay16);
+    let frame = imgwm::build_frame(drand_round, &pay16, &dev_id, &sig_bytes);
+
+    // Load, embed, save
     let img = match image::open(in_path) {
         Ok(i) => i,
         Err(e) => {
@@ -108,27 +154,27 @@ fn cmd_stamp(args: &[String]) {
             std::process::exit(1);
         }
     };
-
     let mut rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
     let npixels = (width * height) as usize;
     let pixels = rgb.as_mut();
 
-    if let Err(e) = imgwm::embed(pixels, npixels, &pay20) {
+    if let Err(e) = imgwm::embed(pixels, npixels, &frame) {
         eprintln!("embed failed: {}", e);
         std::process::exit(1);
     }
-
     if let Err(e) = rgb.save(&out_path) {
         eprintln!("failed to save {}: {}", out_path, e);
         std::process::exit(1);
     }
 
     println!("stamped: {} ({}×{}, {} pixels)", out_path, width, height, npixels);
-    println!("payload: {}", hex(&pay16));
+    println!("  device_id : {}", hex(&dev_id));
+    println!("  drand_round: {}", drand_round);
+    println!("  payload   : {}", hex(&pay16));
 }
 
-fn cmd_verify_image(in_path: &str, specific_round: Option<u64>, json_mode: bool) {
+fn cmd_verify_image(in_path: &str, _specific_round: Option<u64>, json_mode: bool) {
     let img = match image::open(in_path) {
         Ok(i) => i,
         Err(e) => {
@@ -146,8 +192,9 @@ fn cmd_verify_image(in_path: &str, specific_round: Option<u64>, json_mode: bool)
     let npixels = (width * height) as usize;
     let pixels = rgb.as_raw();
 
-    let raw20 = match imgwm::extract(pixels, npixels) {
-        Ok(p) => p,
+    // Extract 96-byte frame
+    let raw_frame = match imgwm::extract(pixels, npixels) {
+        Ok(f) => f,
         Err(e) => {
             if json_mode {
                 println!("{{\"verified\":false,\"error\":\"extract failed: {}\"}}", e);
@@ -157,79 +204,81 @@ fn cmd_verify_image(in_path: &str, specific_round: Option<u64>, json_mode: bool)
             std::process::exit(1);
         }
     };
+    let parsed = imgwm::parse_frame(&raw_frame);
 
-    let decoded_pay = match fec::rs_decode(&raw20) {
-        Some(p) => p,
+    // 1. Check device signature — this is what prevents faking
+    let vk = match device::lookup_device(&parsed.device_id) {
+        Some(k) => k,
         None => {
+            let msg = format!(
+                "unknown device {} — not in trusted registry",
+                hex(&parsed.device_id)
+            );
             if json_mode {
-                println!("{{\"verified\":false,\"error\":\"no valid Signet watermark found\"}}");
+                println!("{{\"verified\":false,\"error\":\"{}\"}}", msg);
             } else {
-                println!("NOT VERIFIED: no valid Signet watermark found");
+                println!("NOT VERIFIED: {}", msg);
             }
             std::process::exit(1);
         }
     };
+    if !device::verify_stamp(&vk, &parsed.signature, parsed.drand_round,
+                              &parsed.device_id, &parsed.drand_payload) {
+        if json_mode {
+            println!("{{\"verified\":false,\"error\":\"device signature invalid\"}}");
+        } else {
+            println!("NOT VERIFIED: device signature invalid");
+        }
+        std::process::exit(1);
+    }
 
-    let rounds_to_try: Vec<u64> = if let Some(r) = specific_round {
-        vec![r]
-    } else {
-        match drand::fetch_latest() {
-            Ok(latest) => {
-                let base = latest.round;
-                let mut rounds = Vec::new();
-                for delta in -5i64..=5 {
-                    let r = base as i64 + delta;
-                    if r > 0 {
-                        rounds.push(r as u64);
-                    }
-                }
-                rounds
+    // 2. Verify drand payload against the chain
+    let round_data = match drand::fetch_round(parsed.drand_round) {
+        Ok(r) => r,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"drand fetch failed: {}\"}}", e);
+            } else {
+                eprintln!("drand fetch failed: {}", e);
             }
-            Err(e) => {
-                if json_mode {
-                    println!("{{\"verified\":false,\"error\":\"drand fetch failed: {}\"}}", e);
-                } else {
-                    eprintln!("drand fetch failed: {}", e);
-                }
-                std::process::exit(1);
-            }
+            std::process::exit(1);
         }
     };
-
-    for round_num in rounds_to_try {
-        let round_data = match drand::fetch_round(round_num) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if expected == decoded_pay {
-            let ts = drand::round_to_unix(round_num);
+    let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
+        Ok(p) => p,
+        Err(_) => {
             if json_mode {
-                println!(
-                    "{{\"verified\":true,\"round\":{},\"time\":\"{}\"}}",
-                    round_num,
-                    unix_to_utc(ts)
-                );
+                println!("{{\"verified\":false,\"error\":\"payload derivation failed\"}}");
             } else {
-                println!(
-                    "VERIFIED: round={} time={} UTC",
-                    round_num,
-                    unix_to_utc(ts)
-                );
+                println!("NOT VERIFIED: payload derivation failed");
             }
-            return;
+            std::process::exit(1);
         }
+    };
+    if expected != parsed.drand_payload {
+        if json_mode {
+            println!("{{\"verified\":false,\"error\":\"drand payload mismatch — image may be tampered\"}}");
+        } else {
+            println!("NOT VERIFIED: drand payload mismatch — image may be tampered");
+        }
+        std::process::exit(1);
     }
 
+    // Both checks pass
+    let ts = drand::round_to_unix(parsed.drand_round);
     if json_mode {
-        println!("{{\"verified\":false,\"error\":\"watermark present but no matching drand round found\"}}");
+        println!(
+            "{{\"verified\":true,\"round\":{},\"time\":\"{}\",\"device_id\":\"{}\"}}",
+            parsed.drand_round,
+            unix_to_utc(ts),
+            hex(&parsed.device_id)
+        );
     } else {
-        println!("NOT VERIFIED: watermark present but no matching drand round found");
+        println!("VERIFIED");
+        println!("  time     : {} UTC", unix_to_utc(ts));
+        println!("  round    : {}", parsed.drand_round);
+        println!("  device_id: {}", hex(&parsed.device_id));
     }
-    std::process::exit(1);
 }
 
 fn cmd_generate(args: &[String]) {
@@ -613,6 +662,7 @@ fn main() {
     }
     let args: Vec<String> = argv.iter().skip(2).cloned().collect();
     match argv[1].as_str() {
+        "enroll" => cmd_enroll(),
         "stamp" => cmd_stamp(&args),
         "verify" => cmd_verify(&args),
         "generate" => cmd_generate(&args),

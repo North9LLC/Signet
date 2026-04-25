@@ -1,5 +1,6 @@
 pub mod channel;
 pub mod crypto;
+pub mod device;
 pub mod drand;
 pub mod fec;
 pub mod imgwm;
@@ -9,29 +10,20 @@ pub mod wav;
 
 // ── C FFI ────────────────────────────────────────────────────────────────────
 //
-// Camera apps call these three functions:
+// Three functions for camera app integration:
 //
-//   1. signet_prefetch_round() — call every 25 s in a background thread.
-//      Fetches the latest drand round and caches the signature in the
-//      provided buffer.  Zero network cost at shutter press.
+//   signet_prefetch_round()  — background thread, every 25 s
+//   signet_stamp_pixels()    — at shutter press, synchronous, < 5 ms
+//   signet_verify_pixels()   — returns 1=verified+trusted, 0=not verified
 //
-//   2. signet_stamp_pixels()   — call synchronously at shutter press.
-//      Embeds the cached signature into raw RGB pixels before the app
-//      encodes or saves the image.  Pure CPU, < 5 ms on any modern phone.
-//
-//   3. signet_verify_pixels()  — call to verify any image later.
-//      Binary result: 1 = verified, 0 = not verified.
+// The stamp is now signed with the device Ed25519 key.  Without that key
+// no-one can produce a valid stamp, even knowing the algorithm.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
-/// Fetch the current drand round.
-///
-/// # Arguments
-/// - `out_round`   — filled with the round number on success
-/// - `out_sig_hex` — filled with the hex-encoded BLS signature (384 chars + NUL)
-/// - `hex_buf_len` — must be ≥ 385
-///
+/// Fetch the current drand round and cache its signature.
+/// `out_sig_hex` must be ≥ 385 bytes.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn signet_prefetch_round(
@@ -50,8 +42,10 @@ pub extern "C" fn signet_prefetch_round(
             }
             unsafe {
                 *out_round = r.round;
-                let buf =
-                    std::slice::from_raw_parts_mut(out_sig_hex as *mut u8, hex_buf_len as usize);
+                let buf = std::slice::from_raw_parts_mut(
+                    out_sig_hex as *mut u8,
+                    hex_buf_len as usize,
+                );
                 buf[..hex.len()].copy_from_slice(hex.as_bytes());
                 buf[hex.len()] = 0;
             }
@@ -61,15 +55,10 @@ pub extern "C" fn signet_prefetch_round(
     }
 }
 
-/// Stamp raw RGB pixels in-place using a drand signature.
+/// Stamp raw RGB pixels with the device key + drand round.
 ///
-/// Call this at shutter press, before encoding/saving the image.
-/// `pixels_rgb` is a flat buffer of `width * height * 3` bytes (R, G, B order).
-///
-/// # Arguments
-/// - `pixels_rgb` — mutable RGB pixel buffer (modified in-place)
-/// - `width`, `height` — image dimensions
-/// - `sig_hex`     — hex drand signature from `signet_prefetch_round`
+/// `sig_hex` is the hex drand signature from `signet_prefetch_round`.
+/// `key_path` is the path to the device key file (NULL = default ~/.signet/device.key).
 ///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -78,6 +67,7 @@ pub extern "C" fn signet_stamp_pixels(
     width: c_int,
     height: c_int,
     sig_hex: *const c_char,
+    drand_round: u64,
 ) -> c_int {
     if pixels_rgb.is_null() || sig_hex.is_null() || width <= 0 || height <= 0 {
         return -1;
@@ -92,24 +82,24 @@ pub extern "C" fn signet_stamp_pixels(
         Ok(p) => p,
         Err(_) => return -1,
     };
-    let pay20 = fec::rs_encode(&pay16);
+    let signing_key = match device::load_or_create_key() {
+        Ok(k) => k,
+        Err(_) => return -1,
+    };
+    let vk = signing_key.verifying_key();
+    let dev_id = device::device_id(&vk);
+    let sig_bytes = device::sign_stamp(&signing_key, drand_round, &dev_id, &pay16);
+    let frame = imgwm::build_frame(drand_round, &pay16, &dev_id, &sig_bytes);
     let npixels = (width * height) as usize;
     let pixels = unsafe { std::slice::from_raw_parts_mut(pixels_rgb, npixels * 3) };
-    match imgwm::embed(pixels, npixels, &pay20) {
+    match imgwm::embed(pixels, npixels, &frame) {
         Ok(()) => 0,
         Err(_) => -1,
     }
 }
 
 /// Verify a Signet watermark in raw RGB pixels.
-///
-/// # Arguments
-/// - `pixels_rgb`    — RGB pixel buffer (read-only)
-/// - `width`, `height` — image dimensions
-/// - `out_round`     — filled with the matching drand round on success
-/// - `out_unix_time` — filled with the UTC Unix timestamp on success
-///
-/// Returns 1 if verified, 0 if not verified or on error.
+/// Returns 1 if VERIFIED (valid drand + trusted device signature), 0 otherwise.
 #[no_mangle]
 pub extern "C" fn signet_verify_pixels(
     pixels_rgb: *const u8,
@@ -124,43 +114,45 @@ pub extern "C" fn signet_verify_pixels(
     let npixels = (width * height) as usize;
     let pixels = unsafe { std::slice::from_raw_parts(pixels_rgb, npixels * 3) };
 
-    let raw20 = match imgwm::extract(pixels, npixels) {
-        Ok(p) => p,
+    let raw_frame = match imgwm::extract(pixels, npixels) {
+        Ok(f) => f,
         Err(_) => return 0,
     };
-    let decoded = match fec::rs_decode(&raw20) {
-        Some(p) => p,
-        None => return 0,
-    };
+    let parsed = imgwm::parse_frame(&raw_frame);
 
-    // Try latest round ±10 rounds (~5 min window)
-    let latest = match drand::fetch_latest() {
+    // Verify device signature first — this is what prevents faking
+    let vk = match device::lookup_device(&parsed.device_id) {
+        Some(k) => k,
+        None => return 0, // unknown / untrusted device
+    };
+    if !device::verify_stamp(
+        &vk,
+        &parsed.signature,
+        parsed.drand_round,
+        &parsed.device_id,
+        &parsed.drand_payload,
+    ) {
+        return 0;
+    }
+
+    // Verify drand payload against the chain
+    let round_data = match drand::fetch_round(parsed.drand_round) {
         Ok(r) => r,
         Err(_) => return 0,
     };
-    for delta in -10i64..=10 {
-        let r = latest.round as i64 + delta;
-        if r <= 0 {
-            continue;
-        }
-        let round_num = r as u64;
-        let round_data = match drand::fetch_round(round_num) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if expected == decoded {
-            if !out_round.is_null() {
-                unsafe { *out_round = round_num };
-            }
-            if !out_unix_time.is_null() {
-                unsafe { *out_unix_time = drand::round_to_unix(round_num) };
-            }
-            return 1;
-        }
+    let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if expected != parsed.drand_payload {
+        return 0;
     }
-    0
+
+    if !out_round.is_null() {
+        unsafe { *out_round = parsed.drand_round };
+    }
+    if !out_unix_time.is_null() {
+        unsafe { *out_unix_time = drand::round_to_unix(parsed.drand_round) };
+    }
+    1
 }
