@@ -7,6 +7,7 @@ pub struct DrandRound {
     pub round: u64,
     pub signature_hex: String,
     pub randomness_hex: String,
+    pub previous_signature_hex: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -14,17 +15,29 @@ struct RawResp {
     round: u64,
     signature: String,
     randomness: String,
+    #[serde(default)]
+    previous_signature: String,
 }
 
 /// Fetch the latest drand round from api.drand.sh via `curl`. 5s timeout.
 pub fn fetch_latest() -> Result<DrandRound, String> {
+    fetch_url("https://api.drand.sh/public/latest")
+}
+
+/// Fetch a specific drand round from api.drand.sh via `curl`. 5s timeout.
+pub fn fetch_round(round: u64) -> Result<DrandRound, String> {
+    fetch_url(&format!("https://api.drand.sh/public/{}", round))
+}
+
+/// Convert a drand round number to a Unix timestamp.
+/// Drand genesis: 1592213100 Unix, period: 30 seconds.
+pub fn round_to_unix(round: u64) -> u64 {
+    1_592_213_100 + (round.saturating_sub(1)) * 30
+}
+
+fn fetch_url(url: &str) -> Result<DrandRound, String> {
     let out = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            "https://api.drand.sh/public/latest",
-        ])
+        .args(["-s", "--max-time", "5", url])
         .output()
         .map_err(|e| format!("failed to spawn curl: {}", e))?;
     if !out.status.success() {
@@ -46,6 +59,7 @@ pub fn from_json(json: &str) -> Result<DrandRound, String> {
         round: raw.round,
         signature_hex: raw.signature,
         randomness_hex: raw.randomness,
+        previous_signature_hex: raw.previous_signature,
     })
 }
 
@@ -60,10 +74,31 @@ mod tests {
         assert_eq!(r.round, 6052808);
         assert_eq!(r.signature_hex.len(), 192);
         assert_eq!(r.randomness_hex.len(), 64);
+        assert_eq!(r.previous_signature_hex, "aa4365d59e6ce201e873d32735d3714cc99d503e2e0e845bdaa45ff02705c1f4");
     }
 
     #[test]
     fn parse_malformed_errors() {
         assert!(from_json("not json").is_err());
+    }
+
+    #[test]
+    fn parse_missing_previous_signature() {
+        // previous_signature is optional (round 1 has none)
+        let js = r#"{"round":1,"randomness":"deadbeef","signature":"cafebabe","previous_signature":""}"#;
+        let r = from_json(js).expect("should parse with empty prev sig");
+        assert_eq!(r.round, 1);
+        assert_eq!(r.previous_signature_hex, "");
+    }
+
+    #[test]
+    fn round_to_unix_known() {
+        // Round 1: genesis = 1592213100
+        assert_eq!(round_to_unix(1), 1592213100);
+        // Round 2: genesis + 30
+        assert_eq!(round_to_unix(2), 1592213130);
+        // Round 6052808: genesis + (6052808-1) * 30
+        let expected = 1_592_213_100 + (6_052_808u64 - 1) * 30;
+        assert_eq!(round_to_unix(6_052_808), expected);
     }
 }
