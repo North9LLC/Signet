@@ -1,6 +1,6 @@
 // Trace a full decode, printing every bit of preamble/sync/payload/CRC side by side.
 use rand::{RngCore, SeedableRng};
-use signet_fsk_proto::{channel, modem, crypto};
+use signet::{channel, fec, modem, crypto};
 
 const FMARK: f32 = modem::FMARK;
 const FSPACE: f32 = modem::FSPACE;
@@ -43,29 +43,33 @@ fn main() {
     let seed: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut pay = [0u8; 16];
-    rng.fill_bytes(&mut pay);
+    let mut pay16 = [0u8; 16];
+    rng.fill_bytes(&mut pay16);
+    let pay20 = fec::rs_encode(&pay16);
 
-    let clean = modem::encode(&pay);
+    let clean = modem::encode(&pay20);
     let cfg = channel::ChannelCfg { snr_db: Some(snr), ..Default::default() };
     let noisy = channel::apply(&clean, &cfg, &mut rng);
 
     println!("seed={} snr={} dB", seed, snr);
-    println!("payload sent: {:02x?}", pay);
-    println!("CRC sent: {:08x}", crypto::crc32(&pay));
+    println!("payload16 sent: {:02x?}", pay16);
+    println!("payload20 sent: {:02x?}", pay20);
+    println!("CRC sent: {:08x}", crypto::crc32(&pay20));
 
-    // Frame layout after fix:
-    //   lead_in: 0..2400 (FMARK)
-    //   gap:     2400..4800 (silence)
-    //   preamble:4800..4800+64*48 = 4800..7872
-    //   sync:    7872..9408
-    //   payload: 9408..15552
-    //   crc:     15552..17088
-    //   trail:   17088..19488
+    // Frame layout at 500 baud / 96 spb:
+    //   lead_in:  0..2400   (FMARK, 50ms)
+    //   gap:      2400..4800 (silence, 50ms)
+    //   preamble: 4800..4800+64*96 = 4800..11136
+    //   sync:     11136..11136+32*96 = 11136..14208
+    //   payload:  14208..14208+160*96 = 14208..29568
+    //   crc:      29568..29568+32*96 = 29568..32640
+    //   trail:    32640..35040
 
-    let bit0 = 4800usize;
+    let lead_in_samples = (modem::LEAD_IN_MS as usize) * (modem::SAMPLE_RATE as usize) / 1000;
+    let gap_samples = (modem::GAP_MS as usize) * (modem::SAMPLE_RATE as usize) / 1000;
+    let bit0 = lead_in_samples + gap_samples;
 
-    // Read preamble at offsets -2..2 and print best.
+    // Read preamble
     let expected_pre = modem::PREAMBLE_BITS;
     let mut best_delta: i32 = 0;
     let mut best_h: u32 = u32::MAX;
@@ -74,10 +78,9 @@ fn main() {
         let bits = read_bits(&noisy, s, 64);
         let v = bits_to_u64(&bits);
         let h = (v ^ expected_pre).count_ones();
-        println!("  preamble delta={:+2} hamming={:2}", d, h);
         if h < best_h { best_h = h; best_delta = d; }
     }
-    println!("best delta {:+} hamming {}", best_delta, best_h);
+    println!("preamble best delta {:+} hamming {}", best_delta, best_h);
 
     let frame_start = (bit0 as i32 + best_delta) as usize;
     let sync_start = frame_start + 64 * N;
@@ -93,26 +96,39 @@ fn main() {
     }
 
     let payload_start = (sync_start as i32 + best_sync_s) as usize + 32 * N;
-    let p_bits = read_bits(&noisy, payload_start, 128);
-    let mut got = [0u8; 16];
-    for i in 0..16 {
+    let p_bits = read_bits(&noisy, payload_start, 160); // 20 bytes
+    let mut got20 = [0u8; 20];
+    for i in 0..20 {
         let mut v = 0u8;
         for j in 0..8 { v = (v << 1) | (p_bits[i*8 + j] as u8); }
-        got[i] = v;
+        got20[i] = v;
     }
-    println!("payload got : {:02x?}", got);
-    println!("payload xor : {:02x?}", got.iter().zip(pay.iter()).map(|(a, b)| a ^ b).collect::<Vec<_>>());
+    println!("payload20 got: {:02x?}", got20);
+    println!("payload20 xor: {:02x?}", got20.iter().zip(pay20.iter()).map(|(a, b)| a ^ b).collect::<Vec<_>>());
 
-    let crc_start = payload_start + 128 * N;
+    match fec::rs_decode(&got20) {
+        Some(p) => println!("FEC decoded: {:02x?} {}", p,
+            if p == pay16 { "MATCH" } else { "MISMATCH" }),
+        None => println!("FEC: uncorrectable"),
+    }
+
+    let crc_start = payload_start + 160 * N;
     let crc_bits = read_bits(&noisy, crc_start, 32);
     let got_crc = bits_to_u32(&crc_bits);
-    let exp_crc = crypto::crc32(&pay);
+    let exp_crc = crypto::crc32(&pay20);
     println!("crc got  : {:08x}", got_crc);
     println!("crc exp  : {:08x}", exp_crc);
     println!("crc xor  : {:08x} (Hamming {})", got_crc ^ exp_crc, (got_crc ^ exp_crc).count_ones());
 
     match modem::decode(&noisy) {
-        Ok(p) => println!("OFFICIAL DECODE: {:02x?} {}", p, if p == pay {"MATCH"} else {"MISMATCH"}),
+        Ok(raw20) => {
+            println!("OFFICIAL RAW20: {:02x?}", raw20);
+            match fec::rs_decode(&raw20) {
+                Some(p) => println!("OFFICIAL DECODE: {:02x?} {}", p,
+                    if p == pay16 { "MATCH" } else { "MISMATCH" }),
+                None => println!("OFFICIAL DECODE FEC: uncorrectable"),
+            }
+        }
         Err(e) => println!("OFFICIAL DECODE ERR: {:?}", e),
     }
 }

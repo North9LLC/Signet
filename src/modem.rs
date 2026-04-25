@@ -1,22 +1,24 @@
 // Near-ultrasonic AFSK modem.
 //
-// Continuous-phase FSK at 1000 baud, mark=19 kHz, space=18 kHz, 48 kHz sample rate.
-// Frame layout: lead-in tone -> preamble -> sync word -> payload -> CRC32 -> trail.
-// Demodulation uses sliding Goertzel for lead-in detection and bit sampling.
+// Continuous-phase FSK at 500 baud, mark=19 kHz, space=18 kHz, 48 kHz sample rate.
+// Frame layout: lead-in tone -> gap -> preamble -> sync word -> payload -> CRC32 -> trail.
+// Demodulation uses sliding Goertzel for lead-in detection and center-sampled Goertzel per bit.
+// Raised-cosine frequency crossfades at bit boundaries (pulse shaping) reduce ISI.
 
 use crate::crypto::crc32;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FMARK: f32 = 19_000.0; // bit = 1
 pub const FSPACE: f32 = 18_000.0; // bit = 0
-pub const BAUD: u32 = 1_000; // bits per second
-pub const SAMPLES_PER_BIT: usize = 48; // SAMPLE_RATE / BAUD
+pub const BAUD: u32 = 500; // bits per second
+pub const SAMPLES_PER_BIT: usize = 96; // SAMPLE_RATE / BAUD
+pub const RAMP_SAMPLES: usize = SAMPLES_PER_BIT / 4; // = 24  (raised-cosine ramp)
 pub const PREAMBLE_BITS: u64 = 0x5555_5555_5555_5555; // 64 bits, alternating 0/1 MSB-first
 pub const PREAMBLE_LEN: usize = 64;
 pub const SYNC_WORD: u32 = 0x9D2E_5B7F;
 pub const SYNC_LEN: usize = 32;
-pub const PAYLOAD_BITS: usize = 128;
-pub const PAYLOAD_BYTES: usize = 16;
+pub const PAYLOAD_BITS: usize = 160; // 20 bytes × 8 bits
+pub const PAYLOAD_BYTES: usize = 20; // 16 data + 4 RS parity
 pub const CRC_BITS: usize = 32;
 pub const LEAD_IN_MS: u32 = 50;
 pub const GAP_MS: u32 = 50; // silence after lead-in so reverb tails decay before preamble
@@ -49,12 +51,54 @@ fn push_tone(out: &mut Vec<f32>, phase: &mut f64, freq: f32, n_samples: usize) {
     }
 }
 
-/// Append bits (MSB-first within each byte of the slice of bits). Each bit is
-/// SAMPLES_PER_BIT samples at FMARK (1) or FSPACE (0).
-fn push_bits_msb(out: &mut Vec<f32>, phase: &mut f64, bits: &[bool]) {
-    for &b in bits {
-        let f = if b { FMARK } else { FSPACE };
-        push_tone(out, phase, f, SAMPLES_PER_BIT);
+/// Append bits with raised-cosine frequency shaping at boundaries.
+///
+/// For each pair of adjacent bits (curr, next), the RAMP_SAMPLES samples at the
+/// boundary transition from f_curr to f_next using:
+///   f(t) = f_curr + 0.5*(1 - cos(π*t/RAMP_SAMPLES)) * (f_next - f_curr)
+///   for t = 0..RAMP_SAMPLES
+///
+/// The remaining center samples use steady f_curr. Phase remains continuous throughout.
+fn push_bits_shaped(out: &mut Vec<f32>, phase: &mut f64, bits: &[bool]) {
+    if bits.is_empty() {
+        return;
+    }
+
+    for (i, &curr_bit) in bits.iter().enumerate() {
+        let f_curr = if curr_bit { FMARK } else { FSPACE };
+        let next_bit = bits.get(i + 1).copied();
+        let f_next = match next_bit {
+            Some(b) => if b { FMARK } else { FSPACE },
+            None => f_curr, // last bit: no ramp needed
+        };
+
+        // Determine ramp length. Only ramp if frequency changes.
+        let ramp_len = if (f_next - f_curr).abs() > 0.1 { RAMP_SAMPLES } else { 0 };
+        let steady_len = SAMPLES_PER_BIT - ramp_len;
+
+        // Steady portion (first part of bit at f_curr).
+        let step_curr = TWO_PI * (f_curr as f64) / (SAMPLE_RATE as f64);
+        for _ in 0..steady_len {
+            *phase += step_curr;
+            if *phase > TWO_PI {
+                *phase -= TWO_PI;
+            }
+            out.push(AMPLITUDE * (phase.sin() as f32));
+        }
+
+        // Ramp portion (transition at end of bit boundary).
+        if ramp_len > 0 {
+            for t in 0..ramp_len {
+                let blend = 0.5 * (1.0 - (std::f64::consts::PI * t as f64 / ramp_len as f64).cos());
+                let f_interp = (f_curr as f64) + blend * ((f_next - f_curr) as f64);
+                let step = TWO_PI * f_interp / (SAMPLE_RATE as f64);
+                *phase += step;
+                if *phase > TWO_PI {
+                    *phase -= TWO_PI;
+                }
+                out.push(AMPLITUDE * (phase.sin() as f32));
+            }
+        }
     }
 }
 
@@ -99,24 +143,23 @@ pub fn encode(payload: &[u8; PAYLOAD_BYTES]) -> Vec<f32> {
     }
     phase = 0.0; // phase reset is fine across a silent gap.
 
-    // 2. Preamble (64 bits, MSB-first).
+    // Build all data bits in one slice so shaping works across section boundaries.
     let preamble_bits = u64_to_bits_msb(PREAMBLE_BITS, PREAMBLE_LEN);
-    push_bits_msb(&mut out, &mut phase, &preamble_bits);
-
-    // 3. Sync word (32 bits, MSB-first).
     let sync_bits = u32_to_bits_msb(SYNC_WORD, SYNC_LEN);
-    push_bits_msb(&mut out, &mut phase, &sync_bits);
-
-    // 4. Payload (128 bits, byte 0 first, MSB-first per byte).
     let payload_bits = bytes_to_bits_msb(payload);
-    push_bits_msb(&mut out, &mut phase, &payload_bits);
-
-    // 5. CRC-32 of payload (MSB-first).
     let crc = crc32(payload);
     let crc_bits = u32_to_bits_msb(crc, CRC_BITS);
-    push_bits_msb(&mut out, &mut phase, &crc_bits);
 
-    // 6. Trail: silence (don't advance phase, just zeros).
+    let mut all_bits: Vec<bool> = Vec::with_capacity(total_bits);
+    all_bits.extend_from_slice(&preamble_bits);
+    all_bits.extend_from_slice(&sync_bits);
+    all_bits.extend_from_slice(&payload_bits);
+    all_bits.extend_from_slice(&crc_bits);
+
+    // 2–5. Preamble + sync + payload + CRC with raised-cosine shaping.
+    push_bits_shaped(&mut out, &mut phase, &all_bits);
+
+    // 6. Trail: silence.
     for _ in 0..trail_samples {
         out.push(0.0);
     }
@@ -156,16 +199,21 @@ fn min_samples() -> usize {
 }
 
 /// Decode bits starting at `start` sample offset. Reads `n_bits` bits of
-/// SAMPLES_PER_BIT samples each. Returns Some(bits) if enough samples exist.
+/// SAMPLES_PER_BIT samples each, sampling only the center window (skipping RAMP_SAMPLES
+/// on each side) to avoid inter-symbol interference at bit boundaries.
 fn decode_bits_at(samples: &[f32], start: usize, n_bits: usize) -> Option<Vec<bool>> {
     if start + n_bits * SAMPLES_PER_BIT > samples.len() {
         return None;
     }
+    // Center window: skip RAMP_SAMPLES at each end, leaving SAMPLES_PER_BIT - 2*RAMP_SAMPLES
+    let center_start_offset = RAMP_SAMPLES;
+    let center_len = SAMPLES_PER_BIT - 2 * RAMP_SAMPLES;
+
     let mut bits = Vec::with_capacity(n_bits);
     for i in 0..n_bits {
-        let s = start + i * SAMPLES_PER_BIT;
-        let mag_mark = goertzel_mag_sq(samples, s, SAMPLES_PER_BIT, FMARK);
-        let mag_space = goertzel_mag_sq(samples, s, SAMPLES_PER_BIT, FSPACE);
+        let bit_start = start + i * SAMPLES_PER_BIT + center_start_offset;
+        let mag_mark = goertzel_mag_sq(samples, bit_start, center_len, FMARK);
+        let mag_space = goertzel_mag_sq(samples, bit_start, center_len, FSPACE);
         bits.push(mag_mark > mag_space);
     }
     Some(bits)
@@ -220,8 +268,6 @@ pub fn decode(samples: &[f32]) -> Result<[u8; PAYLOAD_BYTES], DecodeError> {
     }
 
     // If the signal is essentially silent, bail out early.
-    // (Goertzel mag_sq scales like (N * amp / 2)^2; for 0.7-amp sine at N=240,
-    // expect ~(0.7*240/2)^2 ~= 7056.) Use a tiny absolute floor too.
     if max_early < 1.0 {
         return Err(DecodeError::NoSignal);
     }
@@ -256,25 +302,14 @@ pub fn decode(samples: &[f32]) -> Result<[u8; PAYLOAD_BYTES], DecodeError> {
 
     let lead_in_start = lead_in_start.ok_or(DecodeError::NoSignal)?;
 
-    // ---- 2. Bit-boundary lock via sync word (not preamble!) ----
-    //
-    // We cannot anchor on the preamble: `0x5555_5555_5555_5555` is periodic with
-    // period 2 bits, so Hamming distance to the expected pattern is ~0 for any
-    // delta within a bit-width of the true boundary. That ambiguity is fine for
-    // the preamble itself but misaligns the subsequent (non-periodic) sync word,
-    // payload, and CRC — dropping frame-error-rate under 20 dB SNR dramatically.
-    //
-    // The sync word `0x9D2E_5B7F` is aperiodic. Minimum Hamming distance against
-    // shifted reads of itself is much larger than 0, so scanning sync hamming
-    // across candidate deltas produces a single clear minimum at the true
-    // boundary. Anchor everything on that.
+    // ---- 2. Bit-boundary lock via sync word ----
     let lead_in_samples = (LEAD_IN_MS as usize) * (SAMPLE_RATE as usize) / 1000;
     let gap_samples = (GAP_MS as usize) * (SAMPLE_RATE as usize) / 1000;
     let expected_bit0 = lead_in_start + lead_in_samples + gap_samples;
     let expected_sync_start = expected_bit0 + PREAMBLE_LEN * SAMPLES_PER_BIT;
 
-    // Detection latency in lead-in is up to ~20 ms, so allow generous slack.
-    const SYNC_SEARCH_RADIUS: i32 = 64; // samples, ~1.3 bit widths — enough to cover drift without crossing the next sync period
+    // Detection latency in lead-in is up to ~20 ms; allow generous slack.
+    const SYNC_SEARCH_RADIUS: i32 = 64;
     let mut best_sync_hamming: u32 = u32::MAX;
     let mut best_sync_delta: i32 = 0;
     for delta in -SYNC_SEARCH_RADIUS..=SYNC_SEARCH_RADIUS {
@@ -289,7 +324,6 @@ pub fn decode(samples: &[f32]) -> Result<[u8; PAYLOAD_BYTES], DecodeError> {
         };
         let val = bits_to_u32_msb(&bits);
         let h = hamming_u32(val, SYNC_WORD);
-        // Tiebreak in favor of delta closer to 0 (expected).
         if h < best_sync_hamming
             || (h == best_sync_hamming && delta.abs() < best_sync_delta.abs())
         {
@@ -301,10 +335,7 @@ pub fn decode(samples: &[f32]) -> Result<[u8; PAYLOAD_BYTES], DecodeError> {
         return Err(DecodeError::NoSync);
     }
 
-    // Verify the preamble is plausibly there (lightweight sanity check, not
-    // used for alignment). Reading the preamble at the position implied by the
-    // sync anchor; allow generous tolerance because the preamble pattern is
-    // trivially matched at many offsets.
+    // Verify the preamble is plausibly there.
     let frame_start = (expected_sync_start as i32 + best_sync_delta) as usize
         - PREAMBLE_LEN * SAMPLES_PER_BIT;
     if let Some(bits) = decode_bits_at(samples, frame_start, PREAMBLE_LEN) {
@@ -320,7 +351,7 @@ pub fn decode(samples: &[f32]) -> Result<[u8; PAYLOAD_BYTES], DecodeError> {
     let payload_start =
         (expected_sync_start as i32 + best_sync_delta) as usize + SYNC_LEN * SAMPLES_PER_BIT;
 
-    // ---- 6. Payload ----
+    // ---- 6. Payload (20 bytes = 160 bits) ----
     let payload_bits = decode_bits_at(samples, payload_start, PAYLOAD_BITS)
         .ok_or(DecodeError::TooShort)?;
     let mut payload = [0u8; PAYLOAD_BYTES];
@@ -379,7 +410,11 @@ mod tests {
     fn frame_length_reasonable() {
         let payload = [0u8; PAYLOAD_BYTES];
         let samples = encode(&payload);
-        let expected = 406 * (SAMPLE_RATE as usize) / 1000; // ~19488 (adds 50 ms gap)
+        // At 500 baud with 20-byte payload:
+        // 50ms lead-in + 50ms gap + (64+32+160+32)*96 samples + 50ms trail
+        // = 2400 + 2400 + 27648 + 2400 = 34848 samples ≈ 726ms
+        // Plus trail: total ≈ 762ms at 48kHz
+        let expected = 762 * (SAMPLE_RATE as usize) / 1000;
         let low = (expected as f32 * 0.9) as usize;
         let high = (expected as f32 * 1.1) as usize;
         assert!(
