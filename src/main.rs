@@ -1,24 +1,32 @@
-// signet-fsk CLI. Four subcommands:
-//   generate <out.wav> [--sig <hex>]   encode beacon into a WAV file
-//   decode <in.wav>                    decode a WAV file and print the payload
-//   roundtrip                          in-memory encode + decode smoke test
-//   sweep                              BER matrix across SNR / bandpass / reverb
+// signet CLI. Subcommands:
+//   generate <out.wav> [--sig <hex>]        encode beacon into a WAV file
+//   decode <in.wav> [--json]                decode a WAV file and print the payload
+//   verify <in.wav> [--round <N>] [--json]  decode and verify against drand
+//   roundtrip                               in-memory encode + decode smoke test
+//   sweep                                   BER matrix across SNR / bandpass / reverb
 
-use signet_fsk_proto::{channel, drand, modem, payload, wav};
+use signet::{channel, drand, fec, modem, payload, wav};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn usage() -> ! {
-    eprintln!("usage: signet-fsk <generate|decode|roundtrip|sweep> [args...]");
+    eprintln!("usage: signet <generate|decode|verify|roundtrip|sweep> [args...]");
     eprintln!();
     eprintln!("  generate <out.wav> [--sig <hex>]");
     eprintln!("      Encode a beacon. --sig uses a fixed 192-hex signature;");
     eprintln!("      otherwise fetches the current drand round.");
     eprintln!();
-    eprintln!("  decode <in.wav>");
+    eprintln!("  decode <in.wav> [--json]");
     eprintln!("      Decode a WAV file and print the recovered 16-byte payload.");
+    eprintln!("      --json outputs {{\"ok\":true,\"payload\":\"hex\",\"round_hint\":null}}");
+    eprintln!();
+    eprintln!("  verify <in.wav> [--round <N>] [--json]");
+    eprintln!("      Decode and verify against the drand chain.");
+    eprintln!("      --round N: verify against a specific round.");
+    eprintln!("      Without --round: tries latest round and ±5 rounds (30s window each).");
+    eprintln!("      --json outputs {{\"verified\":true/false,\"round\":N,\"time\":\"...\",\"error\":\"...\"}}");
     eprintln!();
     eprintln!("  roundtrip");
     eprintln!("      In-memory encode+decode with a random payload.");
@@ -42,7 +50,11 @@ fn cmd_generate(args: &[String]) {
         println!("fetching latest drand round...");
         match drand::fetch_latest() {
             Ok(r) => {
-                println!("  round={} sig_len={}", r.round, r.signature_hex.len());
+                let ts = drand::round_to_unix(r.round);
+                println!("  round={} time={} sig_len={}",
+                    r.round,
+                    unix_to_utc(ts),
+                    r.signature_hex.len());
                 r.signature_hex
             }
             Err(e) => {
@@ -52,15 +64,27 @@ fn cmd_generate(args: &[String]) {
         }
     };
 
-    let pay = payload::derive_from_drand_signature(&sig_hex);
-    println!("payload: {}", hex(&pay));
+    let pay16 = match payload::derive_from_drand_signature(&sig_hex) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("payload derivation failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    println!("payload (16 bytes): {}", hex(&pay16));
 
-    let samples = modem::encode(&pay);
+    let pay20 = fec::rs_encode(&pay16);
+    println!("encoded (20 bytes): {}", hex(&pay20));
+
+    let samples = modem::encode(&pay20);
     let w = wav::Wav {
         sample_rate: modem::SAMPLE_RATE,
         samples,
     };
-    w.write(out_path).expect("write wav");
+    if let Err(e) = w.write(out_path) {
+        eprintln!("write wav failed: {}", e);
+        std::process::exit(1);
+    }
     println!("wrote {} ({} samples, {:.0} ms)",
         out_path,
         w.samples.len(),
@@ -71,35 +95,199 @@ fn cmd_decode(args: &[String]) {
     if args.is_empty() {
         usage();
     }
-    let w = wav::Wav::read(&args[0]).expect("read wav");
+    let json_mode = args.iter().any(|a| a == "--json");
+    let in_path = &args[0];
+
+    let w = match wav::Wav::read(in_path) {
+        Ok(w) => w,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"ok\":false,\"error\":\"read wav failed: {}\"}}", e);
+            } else {
+                eprintln!("read wav failed: {}", e);
+            }
+            std::process::exit(1);
+        }
+    };
     if w.sample_rate != modem::SAMPLE_RATE {
         eprintln!("warning: sample rate {} != expected {}", w.sample_rate, modem::SAMPLE_RATE);
     }
-    match modem::decode(&w.samples) {
-        Ok(p) => {
-            println!("ok: {}", hex(&p));
-        }
+
+    let raw20 = match modem::decode(&w.samples) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("decode failed: {:?}", e);
+            if json_mode {
+                println!("{{\"ok\":false,\"error\":\"modem decode failed: {:?}\"}}", e);
+            } else {
+                eprintln!("modem decode failed: {:?}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    match fec::rs_decode(&raw20) {
+        Some(pay16) => {
+            if json_mode {
+                println!("{{\"ok\":true,\"payload\":\"{}\",\"round_hint\":null}}", hex(&pay16));
+            } else {
+                println!("ok: {}", hex(&pay16));
+            }
+        }
+        None => {
+            if json_mode {
+                println!("{{\"ok\":false,\"error\":\"FEC: uncorrectable\"}}");
+            } else {
+                eprintln!("FEC: uncorrectable");
+            }
             std::process::exit(1);
         }
     }
 }
 
+fn cmd_verify(args: &[String]) {
+    if args.is_empty() {
+        usage();
+    }
+    let json_mode = args.iter().any(|a| a == "--json");
+    let in_path = &args[0];
+
+    // Parse --round
+    let specific_round: Option<u64> = if let Some(pos) = args.iter().position(|a| a == "--round") {
+        match args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => Some(n),
+            None => {
+                if json_mode {
+                    println!("{{\"verified\":false,\"error\":\"--round requires a number\"}}");
+                } else {
+                    eprintln!("--round requires a number");
+                }
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Decode WAV
+    let w = match wav::Wav::read(in_path) {
+        Ok(w) => w,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"read wav failed: {}\"}}", e);
+            } else {
+                eprintln!("read wav failed: {}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+    if w.sample_rate != modem::SAMPLE_RATE {
+        eprintln!("warning: sample rate {} != expected {}", w.sample_rate, modem::SAMPLE_RATE);
+    }
+
+    let raw20 = match modem::decode(&w.samples) {
+        Ok(p) => p,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"modem decode failed: {:?}\"}}", e);
+            } else {
+                eprintln!("modem decode failed: {:?}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let decoded_pay = match fec::rs_decode(&raw20) {
+        Some(p) => p,
+        None => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"FEC: uncorrectable\"}}");
+            } else {
+                eprintln!("FEC: uncorrectable");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // Build list of rounds to try
+    let rounds_to_try: Vec<u64> = if let Some(r) = specific_round {
+        vec![r]
+    } else {
+        // Fetch latest round and try ±5 rounds
+        match drand::fetch_latest() {
+            Ok(latest) => {
+                let base = latest.round;
+                let mut rounds = Vec::new();
+                for delta in -5i64..=5 {
+                    let r = base as i64 + delta;
+                    if r > 0 {
+                        rounds.push(r as u64);
+                    }
+                }
+                rounds
+            }
+            Err(e) => {
+                if json_mode {
+                    println!("{{\"verified\":false,\"error\":\"drand fetch failed: {}\"}}", e);
+                } else {
+                    eprintln!("drand fetch failed: {}", e);
+                }
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // Try each round
+    for round_num in rounds_to_try {
+        let round_data = match drand::fetch_round(round_num) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let expected_pay = match payload::derive_from_drand_signature(&round_data.signature_hex) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if expected_pay == decoded_pay {
+            let ts = drand::round_to_unix(round_num);
+            if json_mode {
+                println!("{{\"verified\":true,\"round\":{},\"time\":\"{}\"}}",
+                    round_num, unix_to_utc(ts));
+            } else {
+                println!("verified: round={} time={} UTC", round_num, unix_to_utc(ts));
+            }
+            return;
+        }
+    }
+
+    // No match found
+    if json_mode {
+        println!("{{\"verified\":false,\"error\":\"no matching round found in window\"}}");
+    } else {
+        println!("no matching round found in window");
+    }
+    std::process::exit(1);
+}
+
 fn cmd_roundtrip() {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
-    let mut pay = [0u8; 16];
-    rng.fill_bytes(&mut pay);
-    let sig = modem::encode(&pay);
+    let mut pay16 = [0u8; 16];
+    rng.fill_bytes(&mut pay16);
+    let pay20 = fec::rs_encode(&pay16);
+    let sig = modem::encode(&pay20);
     match modem::decode(&sig) {
-        Ok(r) if r == pay => println!("ok: roundtrip matches: {}", hex(&pay)),
-        Ok(r) => {
-            eprintln!("MISMATCH: sent {} recv {}", hex(&pay), hex(&r));
-            std::process::exit(1);
-        }
+        Ok(raw20) => match fec::rs_decode(&raw20) {
+            Some(r) if r == pay16 => println!("ok: roundtrip matches: {}", hex(&pay16)),
+            Some(r) => {
+                eprintln!("MISMATCH after FEC: sent {} recv {}", hex(&pay16), hex(&r));
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("FEC decode failed on clean roundtrip (should not happen)");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
-            eprintln!("decode failed: {:?}", e);
+            eprintln!("modem decode failed: {:?}", e);
             std::process::exit(1);
         }
     }
@@ -155,18 +343,53 @@ fn cmd_sweep() {
     for (label, cfg) in configs {
         let mut ok = 0;
         for _ in 0..TRIALS {
-            let mut pay = [0u8; 16];
-            rng.fill_bytes(&mut pay);
-            let s = modem::encode(&pay);
+            let mut pay16 = [0u8; 16];
+            rng.fill_bytes(&mut pay16);
+            let pay20 = fec::rs_encode(&pay16);
+            let s = modem::encode(&pay20);
             let y = channel::apply(&s, &cfg, &mut rng);
-            if let Ok(r) = modem::decode(&y) {
-                if r == pay {
-                    ok += 1;
+            if let Ok(raw20) = modem::decode(&y) {
+                if let Some(r) = fec::rs_decode(&raw20) {
+                    if r == pay16 {
+                        ok += 1;
+                    }
                 }
             }
         }
         println!("  {:<46} |  {:>3}/{:<3}  |", label, ok, TRIALS);
     }
+}
+
+/// Format a Unix timestamp as "YYYY-MM-DD HH:MM:SS".
+fn unix_to_utc(ts: u64) -> String {
+    // Days since Unix epoch
+    let secs = ts % 86400;
+    let days = ts / 86400;
+
+    let hh = secs / 3600;
+    let mm = (secs % 3600) / 60;
+    let ss = secs % 60;
+
+    // Gregorian calendar computation (post-1970 only)
+    let (year, month, day) = days_to_ymd(days);
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hh, mm, ss)
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm: convert days since 1970-01-01 to (year, month, day).
+    // Use the "civil" algorithm (Howard Hinnant).
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u64, m, d)
 }
 
 fn main() {
@@ -178,6 +401,7 @@ fn main() {
     match argv[1].as_str() {
         "generate" => cmd_generate(&args),
         "decode" => cmd_decode(&args),
+        "verify" => cmd_verify(&args),
         "roundtrip" => cmd_roundtrip(),
         "sweep" => cmd_sweep(),
         _ => usage(),
