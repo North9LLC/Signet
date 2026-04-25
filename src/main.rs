@@ -1,39 +1,235 @@
 // signet CLI. Subcommands:
-//   generate <out.wav> [--sig <hex>]        encode beacon into a WAV file
-//   decode <in.wav> [--json]                decode a WAV file and print the payload
-//   verify <in.wav> [--round <N>] [--json]  decode and verify against drand
-//   roundtrip                               in-memory encode + decode smoke test
-//   sweep                                   BER matrix across SNR / bandpass / reverb
+//   stamp <in.jpg|png> [--out <out.png>] [--sig <hex>]   embed beacon watermark into an image
+//   verify <in.jpg|png|wav> [--round <N>] [--json]       verify image or WAV watermark
+//   generate <out.wav> [--sig <hex>]                     encode beacon into a WAV file
+//   decode <in.wav> [--json]                             decode a WAV file and print the payload
+//   roundtrip                                            in-memory encode + decode smoke test
+//   sweep                                                BER matrix across SNR / bandpass / reverb
 
-use signet::{channel, drand, fec, modem, payload, wav};
+use signet::{channel, drand, fec, imgwm, modem, payload, wav};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn usage() -> ! {
-    eprintln!("usage: signet <generate|decode|verify|roundtrip|sweep> [args...]");
+    eprintln!("usage: signet <stamp|verify|generate|decode|roundtrip|sweep> [args...]");
+    eprintln!();
+    eprintln!("  stamp <in.jpg|png> [--out <out.png>] [--sig <hex>]");
+    eprintln!("      Embed an invisible drand watermark into an image.");
+    eprintln!("      Output is always PNG (lossless) so the watermark is preserved.");
+    eprintln!("      --out sets the output path (default: <stem>_stamped.png).");
+    eprintln!();
+    eprintln!("  verify <in.jpg|png|wav> [--round <N>] [--json]");
+    eprintln!("      Verify the Signet watermark in an image or WAV file.");
+    eprintln!("      For images: extracts the embedded payload and checks against drand.");
+    eprintln!("      --round N: verify against a specific round only.");
+    eprintln!("      --json outputs {{\"verified\":true/false,\"round\":N,\"time\":\"...\",\"error\":\"...\"}}");
     eprintln!();
     eprintln!("  generate <out.wav> [--sig <hex>]");
-    eprintln!("      Encode a beacon. --sig uses a fixed 192-hex signature;");
-    eprintln!("      otherwise fetches the current drand round.");
+    eprintln!("      Encode a beacon into a WAV audio file.");
     eprintln!();
     eprintln!("  decode <in.wav> [--json]");
     eprintln!("      Decode a WAV file and print the recovered 16-byte payload.");
-    eprintln!("      --json outputs {{\"ok\":true,\"payload\":\"hex\",\"round_hint\":null}}");
-    eprintln!();
-    eprintln!("  verify <in.wav> [--round <N>] [--json]");
-    eprintln!("      Decode and verify against the drand chain.");
-    eprintln!("      --round N: verify against a specific round.");
-    eprintln!("      Without --round: tries latest round and ±5 rounds (30s window each).");
-    eprintln!("      --json outputs {{\"verified\":true/false,\"round\":N,\"time\":\"...\",\"error\":\"...\"}}");
     eprintln!();
     eprintln!("  roundtrip");
     eprintln!("      In-memory encode+decode with a random payload.");
     eprintln!();
     eprintln!("  sweep");
-    eprintln!("      Run a BER matrix across SNR / bandpass / reverb.");
+    eprintln!("      BER matrix across SNR / bandpass / reverb (audio).");
     std::process::exit(2);
+}
+
+fn is_image_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+}
+
+fn cmd_stamp(args: &[String]) {
+    if args.is_empty() {
+        usage();
+    }
+    let in_path = &args[0];
+
+    let out_path = if let Some(pos) = args.iter().position(|a| a == "--out") {
+        args.get(pos + 1).cloned().unwrap_or_else(|| {
+            eprintln!("--out requires a value");
+            std::process::exit(2);
+        })
+    } else {
+        let stem = std::path::Path::new(in_path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        format!("{}_stamped.png", stem)
+    };
+
+    let sig_hex = if let Some(pos) = args.iter().position(|a| a == "--sig") {
+        args.get(pos + 1).cloned().unwrap_or_else(|| {
+            eprintln!("--sig requires a value");
+            std::process::exit(2);
+        })
+    } else {
+        println!("fetching latest drand round...");
+        match drand::fetch_latest() {
+            Ok(r) => {
+                let ts = drand::round_to_unix(r.round);
+                println!(
+                    "  round={} time={} UTC",
+                    r.round,
+                    unix_to_utc(ts)
+                );
+                r.signature_hex
+            }
+            Err(e) => {
+                eprintln!("drand fetch failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let pay16 = match payload::derive_from_drand_signature(&sig_hex) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("payload derivation failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let pay20 = fec::rs_encode(&pay16);
+
+    let img = match image::open(in_path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("failed to open image {}: {}", in_path, e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let npixels = (width * height) as usize;
+    let pixels = rgb.as_mut();
+
+    if let Err(e) = imgwm::embed(pixels, npixels, &pay20) {
+        eprintln!("embed failed: {}", e);
+        std::process::exit(1);
+    }
+
+    if let Err(e) = rgb.save(&out_path) {
+        eprintln!("failed to save {}: {}", out_path, e);
+        std::process::exit(1);
+    }
+
+    println!("stamped: {} ({}×{}, {} pixels)", out_path, width, height, npixels);
+    println!("payload: {}", hex(&pay16));
+}
+
+fn cmd_verify_image(in_path: &str, specific_round: Option<u64>, json_mode: bool) {
+    let img = match image::open(in_path) {
+        Ok(i) => i,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"open failed: {}\"}}", e);
+            } else {
+                eprintln!("failed to open image {}: {}", in_path, e);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let npixels = (width * height) as usize;
+    let pixels = rgb.as_raw();
+
+    let raw20 = match imgwm::extract(pixels, npixels) {
+        Ok(p) => p,
+        Err(e) => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"extract failed: {}\"}}", e);
+            } else {
+                eprintln!("extract failed: {}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let decoded_pay = match fec::rs_decode(&raw20) {
+        Some(p) => p,
+        None => {
+            if json_mode {
+                println!("{{\"verified\":false,\"error\":\"no valid Signet watermark found\"}}");
+            } else {
+                println!("NOT VERIFIED: no valid Signet watermark found");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let rounds_to_try: Vec<u64> = if let Some(r) = specific_round {
+        vec![r]
+    } else {
+        match drand::fetch_latest() {
+            Ok(latest) => {
+                let base = latest.round;
+                let mut rounds = Vec::new();
+                for delta in -5i64..=5 {
+                    let r = base as i64 + delta;
+                    if r > 0 {
+                        rounds.push(r as u64);
+                    }
+                }
+                rounds
+            }
+            Err(e) => {
+                if json_mode {
+                    println!("{{\"verified\":false,\"error\":\"drand fetch failed: {}\"}}", e);
+                } else {
+                    eprintln!("drand fetch failed: {}", e);
+                }
+                std::process::exit(1);
+            }
+        }
+    };
+
+    for round_num in rounds_to_try {
+        let round_data = match drand::fetch_round(round_num) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let expected = match payload::derive_from_drand_signature(&round_data.signature_hex) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if expected == decoded_pay {
+            let ts = drand::round_to_unix(round_num);
+            if json_mode {
+                println!(
+                    "{{\"verified\":true,\"round\":{},\"time\":\"{}\"}}",
+                    round_num,
+                    unix_to_utc(ts)
+                );
+            } else {
+                println!(
+                    "VERIFIED: round={} time={} UTC",
+                    round_num,
+                    unix_to_utc(ts)
+                );
+            }
+            return;
+        }
+    }
+
+    if json_mode {
+        println!("{{\"verified\":false,\"error\":\"watermark present but no matching drand round found\"}}");
+    } else {
+        println!("NOT VERIFIED: watermark present but no matching drand round found");
+    }
+    std::process::exit(1);
 }
 
 fn cmd_generate(args: &[String]) {
@@ -150,6 +346,24 @@ fn cmd_verify(args: &[String]) {
     }
     let json_mode = args.iter().any(|a| a == "--json");
     let in_path = &args[0];
+
+    // Route image files to the image verifier
+    if is_image_path(in_path) {
+        let specific_round: Option<u64> =
+            if let Some(pos) = args.iter().position(|a| a == "--round") {
+                match args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) => Some(n),
+                    None => {
+                        eprintln!("--round requires a number");
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
+            };
+        cmd_verify_image(in_path, specific_round, json_mode);
+        return;
+    }
 
     // Parse --round
     let specific_round: Option<u64> = if let Some(pos) = args.iter().position(|a| a == "--round") {
@@ -399,9 +613,10 @@ fn main() {
     }
     let args: Vec<String> = argv.iter().skip(2).cloned().collect();
     match argv[1].as_str() {
+        "stamp" => cmd_stamp(&args),
+        "verify" => cmd_verify(&args),
         "generate" => cmd_generate(&args),
         "decode" => cmd_decode(&args),
-        "verify" => cmd_verify(&args),
         "roundtrip" => cmd_roundtrip(),
         "sweep" => cmd_sweep(),
         _ => usage(),
