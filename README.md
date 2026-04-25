@@ -1,48 +1,160 @@
 # Signet
 
-Signet invisibly embeds a cryptographic timestamp into images (and audio) at the moment they are captured, so anyone can later verify they are real.
+A cryptographic watermarking SDK that camera apps embed to certify photos are real.
 
-The stamp is derived from the [drand](https://drand.love/) public randomness beacon — a decentralized network that publishes a new unforgeable signature every 30 seconds. A Signet-stamped image contains that signature encoded across its pixels. Verification is public and non-interactive: either the cryptographic proof checks out, or it does not.
-
-**There is no probability, no score, no model.** The output is binary: `VERIFIED` or `NOT VERIFIED`.
+The stamp happens **inside the camera app, at the moment the shutter fires** — before the image is encoded or saved. There is no post-processing step. A Signet-certified photo carries an unforgeable cryptographic proof derived from the [drand](https://drand.love/) public randomness beacon (operated by Cloudflare, EPFL, Protocol Labs). Verification is binary, public, and non-interactive: either the math checks out or it doesn't.
 
 ---
 
 ## How it works
 
-1. **Capture + stamp** — When you take a photo, run `signet stamp photo.jpg`. Signet fetches the current drand round, derives a 16-byte payload via HKDF-SHA256, encodes it with Reed-Solomon FEC, and spreads the 160-bit codeword invisibly across every pixel's blue channel LSB. The change is invisible to the human eye.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Camera App                                                     │
+│                                                                 │
+│  1. [Background thread, every 25s]                              │
+│     signet_prefetch_round() → cache drand signature             │
+│                                                                 │
+│  2. [Shutter press — synchronous, < 5 ms]                       │
+│     signet_stamp_pixels(raw_pixels, sig)                        │
+│     ↓ invisible LSB watermark embedded                          │
+│                                                                 │
+│  3. [Normal encode path]                                        │
+│     Encode stamped pixels → JPEG/HEIC/PNG → save to disk        │
+└─────────────────────────────────────────────────────────────────┘
 
-2. **Spread-spectrum embedding** — Each of the 160 bits is written to every 160th pixel, giving a 12 MP image ~75 000 votes per bit. Even aggressive JPEG compression or minor editing cannot flip enough votes to destroy the signal — the RS code corrects any remaining errors.
+┌─────────────────────────────────────────────────────────────────┐
+│  Verifier (anyone, anywhere)                                    │
+│                                                                 │
+│  signet_verify_pixels(pixels) → VERIFIED (round + timestamp)   │
+│                              or NOT VERIFIED                    │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-3. **Verify** — Anyone with the image can run `signet verify photo.png`. Signet reads the blue-channel LSBs, majority-votes each bit position, RS-decodes the 16-byte payload, and checks it against the live drand chain. If the signature matches a known round, the image is `VERIFIED` with the exact UTC timestamp it was stamped.
+**Why pre-fetch?** drand publishes a new round every 30 seconds. The app caches the signature in the background so shutter press is instant — no network round-trip during capture.
 
-4. **Binary outcome** — If the watermark is intact and the cryptographic check passes: `VERIFIED`. If there is no watermark, the watermark is broken, or the payload does not match any drand round: `NOT VERIFIED`. No gray area.
+**Why inside the app?** Post-processing after capture creates a window where an AI-generated image could be submitted for stamping. Embedding at capture time inside a trusted app closes that window. The stamp certifies: *these raw pixels existed at this moment inside this software*.
 
 ---
 
-## Quick start
+## SDK integration
+
+### iOS
+
+```swift
+// AppDelegate or CameraViewController setup
+SignetSDK.shared.start()  // begins background prefetch
+
+// Inside your AVCapturePhotoCaptureDelegate
+func photoOutput(_ output: AVCapturePhotoOutput,
+                 didFinishProcessingPhoto photo: AVCapturePhoto,
+                 error: Error?) {
+    guard let pixelBuffer = photo.pixelBuffer else { return }
+    SignetSDK.shared.stamp(pixelBuffer: pixelBuffer)  // < 5 ms
+    // ... encode and save as normal
+}
+
+// Verify any image
+if let result = SignetSDK.verify(pixelBuffer: pixelBuffer) {
+    print("VERIFIED: \(result.dateString)")  // e.g. "2026-04-25T06:00:00Z"
+} else {
+    print("NOT VERIFIED")
+}
+```
+
+See `sdk/ios/SignetSDK.swift`.
+
+### Android
+
+```kotlin
+// In your Application or Camera setup
+SignetSDK.start()
+
+// In your ImageCapture.OnImageCapturedCallback
+val bitmap = imageProxy.toBitmap()
+SignetSDK.stamp(bitmap)  // < 5 ms, modifies in-place
+// ... encode and save
+
+// Verify any image
+val result = SignetSDK.verify(bitmap)
+if (result != null) {
+    println("VERIFIED: ${result.isoTime}")
+} else {
+    println("NOT VERIFIED")
+}
+```
+
+See `sdk/android/SignetSDK.kt`.
+
+### C / C++ (any platform)
+
+```c
+#include "signet.h"
+
+// Background thread — call every 25 s
+char sig_hex[512];
+uint64_t round;
+signet_prefetch_round(&round, sig_hex, sizeof(sig_hex));
+
+// At shutter press — synchronous, no network
+signet_stamp_pixels(pixels_rgb, width, height, sig_hex);
+
+// Verification
+uint64_t verified_round, unix_time;
+int ok = signet_verify_pixels(pixels_rgb, width, height, &verified_round, &unix_time);
+// ok == 1 → VERIFIED, ok == 0 → NOT VERIFIED
+```
+
+See `include/signet.h`.
+
+---
+
+## Building the library
 
 ```sh
-# Stamp a photo (output is always PNG to preserve the watermark losslessly)
+# Shared library (.so / .dylib)
+cargo build --release
+# → target/release/libsignet.so  (Linux)
+# → target/release/libsignet.dylib  (macOS)
+
+# Static library (.a) — for embedding into iOS/Android NDK builds
+cargo build --release
+# → target/release/libsignet.a
+
+# iOS XCFramework (arm64 device + x86_64 simulator)
+cargo build --release --target aarch64-apple-ios
+cargo build --release --target x86_64-apple-ios
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/libsignet.a \
+  -library target/x86_64-apple-ios/release/libsignet.a \
+  -output Signet.xcframework
+
+# Android NDK
+cargo build --release --target aarch64-linux-android
+cargo build --release --target armv7-linux-androideabi
+```
+
+---
+
+## CLI reference tool
+
+The CLI is a reference implementation and developer tool — not the end-user product.
+
+```sh
+# Stamp a photo (for testing; real apps stamp inside the pipeline)
 signet stamp photo.jpg
 # → photo_stamped.png
 
-# Stamp with a custom output path
-signet stamp photo.jpg --out certified.png
-
-# Verify a stamped image
-signet verify certified.png
+# Verify
+signet verify photo_stamped.png
 # → VERIFIED: round=6052808 time=2026-04-25 06:00:00 UTC
 
-# Verify and get JSON output (for tooling)
-signet verify certified.png --json
+# JSON output (for tooling)
+signet verify photo_stamped.png --json
 # → {"verified":true,"round":6052808,"time":"2026-04-25 06:00:00"}
 
-# Verify against a specific drand round
-signet verify certified.png --round 6052808
-
-# Verify an image that was not stamped
-signet verify unknown.jpg
+# Unstamped or AI-generated image
+signet verify suspect.jpg
 # → NOT VERIFIED: no valid Signet watermark found
 ```
 
@@ -50,60 +162,50 @@ signet verify unknown.jpg
 
 ## Why this is court-ready
 
-- **Cryptographic proof, not a model.** There is no classifier, no threshold, no confidence score. The drand signature is mathematically verifiable and publicly auditable.
-- **Decentralized beacon.** Drand is operated by a league-of-entropy coalition (Cloudflare, EPFL, Protocol Labs). No single party can retroactively forge a round signature.
-- **Non-interactive verification.** Anyone with the image and an internet connection can verify. No proprietary API, no account, no black box.
-- **Tamper-evident.** Editing the image (cropping, color adjustments, AI inpainting) disrupts enough pixel votes that the watermark fails to decode. The RS code distinguishes minor transmission noise from intentional modification.
+- **No model, no score.** The drand BLS signature either matches or it doesn't. Binary.
+- **Decentralized beacon.** No single entity controls drand. Past round signatures cannot be forged retroactively.
+- **Non-interactive verification.** Anyone with the image and internet access can verify. No proprietary API.
+- **Tamper-evident.** Meaningful edits (cropping, inpainting, compositing) destroy enough pixel votes that FEC fails to decode.
+- **Open standard.** The watermarking algorithm, payload derivation, and drand chain are all public.
 
-**What Signet proves:** This image was processed by Signet software no earlier than the timestamp of the embedded drand round.
+**What Signet proves:** These pixels existed, unmodified, inside Signet-integrated software at the stated drand round.
 
-**What Signet does not prove:** Images without a Signet watermark are not necessarily AI-generated — older cameras and software do not embed it. Signet is a positive certification standard, not a universal AI detector.
+**Limitation:** Signet certifies enrolled cameras and apps. Images without a valid watermark are unverified — not proven AI. Adoption is the key driver: the more apps embed Signet, the stronger the signal.
 
 ---
 
 ## Technical details
 
-### Watermark embedding
-
 | Parameter | Value |
 |---|---|
-| Payload | 16-byte HKDF-SHA256 of drand signature |
-| FEC | RS(20,16) over GF(256) — corrects up to 2 symbol errors |
+| Payload | 16-byte HKDF-SHA256(drand signature, "signet-v1") |
+| FEC | RS(20,16) over GF(256) — 4 parity bytes, corrects ≤ 2 symbol errors |
 | Embedded bits | 160 (20 bytes × 8) |
-| Channel | Blue channel LSB of RGB8 pixels |
+| Embedding channel | Blue channel LSB of RGB8 |
 | Spread | Bit b → pixels b, b+160, b+320, … |
 | Votes per bit (12 MP) | ~75 000 |
-| Output format | PNG (lossless) |
-
-### drand beacon
-
-| Parameter | Value |
-|---|---|
-| Network | League of Entropy (Cloudflare / EPFL / Protocol Labs) |
-| API | `https://api.drand.sh/public/{round}` |
+| Min image size | 1 600 pixels |
+| drand network | League of Entropy — `https://api.drand.sh/public/{round}` |
 | Round period | 30 seconds |
-| Genesis | 2020-06-15 18:25:00 UTC |
-
-### Audio watermarking (legacy)
-
-Signet also supports near-ultrasonic audio watermarking (18–19 kHz AFSK) for video recordings where you cannot embed directly into the image bytes. See `signet generate` and `signet verify <file.wav>`.
-
----
 
 ## Source layout
 
 ```
+include/
+└── signet.h              C header (FFI API)
+sdk/
+├── ios/SignetSDK.swift    iOS drop-in integration
+└── android/SignetSDK.kt  Android drop-in integration
 src/
-├── main.rs        CLI (stamp / verify / generate / decode / roundtrip / sweep)
-├── lib.rs
-├── imgwm.rs       Image watermark embed + majority-vote extract
-├── modem.rs       AFSK encode + sync-anchored decode, raised-cosine shaping
-├── fec.rs         Reed-Solomon RS(20,16) over GF(256)
-├── channel.rs     Reverb, bandpass, AWGN (audio simulation)
-├── crypto.rs      HMAC-SHA256, HKDF-SHA256, CRC-32
-├── wav.rs         16-bit PCM mono WAV reader/writer
-├── payload.rs     drand signature → 16-byte HKDF payload
-└── drand.rs       HTTP fetch, round/timestamp helpers
+├── main.rs               CLI reference tool
+├── lib.rs                Library root + C FFI exports
+├── imgwm.rs              Spread-spectrum embed + majority-vote extract
+├── fec.rs                Reed-Solomon RS(20,16) over GF(256)
+├── crypto.rs             HKDF-SHA256, CRC-32
+├── payload.rs            drand signature → 16-byte payload
+├── drand.rs              HTTP fetch, round/timestamp helpers
+├── modem.rs              Audio AFSK (legacy)
+└── wav.rs                WAV I/O (legacy)
 ```
 
 ## License
