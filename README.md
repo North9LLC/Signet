@@ -26,7 +26,7 @@ The stamp happens **inside the camera app, at the moment the shutter fires** —
 ┌─────────────────────────────────────────────────────────────────┐
 │  Verifier (anyone, anywhere)                                    │
 │                                                                 │
-│  signet_verify_pixels(pixels) → VERIFIED (round + timestamp)   │
+│  signet_verify_pixels(pixels) → VERIFIED (round + timestamp)    │
 │                              or NOT VERIFIED                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
