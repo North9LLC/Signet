@@ -223,4 +223,9 @@ src/
 
 ## License
 
-MIT.
+Signet is dual-licensed:
+
+- **Open source:** [GNU Affero General Public License v3.0](LICENSE) — free for open source camera apps and personal projects
+- **Commercial:** contact [licensing@north9.org](mailto:licensing@north9.org) for proprietary apps, government/law enforcement, enterprise, or OEM SDK use
+
+See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) for details.

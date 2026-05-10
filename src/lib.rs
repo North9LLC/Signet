@@ -1,3 +1,5 @@
+// Copyright (c) 2025 North9 LLC
+// SPDX-License-Identifier: AGPL-3.0-only
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod channel;
 pub mod crypto;
