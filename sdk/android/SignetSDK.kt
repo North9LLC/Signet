@@ -1,4 +1,4 @@
-package ing.paperclip.signet
+package org.north9.signet
 
 import android.graphics.Bitmap
 import android.graphics.Color

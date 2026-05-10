@@ -1,3 +1,4 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod channel;
 pub mod crypto;
 pub mod device;
@@ -91,12 +92,14 @@ pub extern "C" fn signet_stamp_pixels(
         Ok(k) => k,
         Err(_) => return -1,
     };
-    let npixels = (width as i64)
+    let npixels = match (width as i64)
         .checked_mul(height as i64)
         .filter(|&n| n > 0 && n <= 100_000_000)
         .map(|n| n as usize)
-        .ok_or(())
-        .unwrap_or_else(|_| return -1);
+    {
+        Some(n) => n,
+        None => return -1,
+    };
     let pixels = unsafe { std::slice::from_raw_parts_mut(pixels_rgb, npixels * 3) };
     // Compute pixel commitment BEFORE modifying pixels
     let pix_hash = imgwm::pixel_commitment(pixels);
@@ -131,12 +134,14 @@ pub extern "C" fn signet_verify_pixels(
     if pixels_rgb.is_null() || width <= 0 || height <= 0 {
         return 0;
     }
-    let npixels = (width as i64)
+    let npixels = match (width as i64)
         .checked_mul(height as i64)
         .filter(|&n| n > 0 && n <= 100_000_000)
         .map(|n| n as usize)
-        .ok_or(())
-        .unwrap_or_else(|_| return 0);
+    {
+        Some(n) => n,
+        None => return 0,
+    };
     let pixels = unsafe { std::slice::from_raw_parts(pixels_rgb, npixels * 3) };
 
     let raw_frame = match imgwm::extract(pixels, npixels) {

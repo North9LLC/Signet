@@ -12,6 +12,7 @@ use rand::Rng;
 /// Sample rate used throughout the simulator, in Hz.
 pub const SAMPLE_RATE: u32 = 48_000;
 
+#[derive(Default)]
 pub struct ChannelCfg {
     /// If Some, add additive white Gaussian noise to achieve this in-band SNR (dB).
     pub snr_db: Option<f32>,
@@ -19,16 +20,6 @@ pub struct ChannelCfg {
     pub bandpass: Option<(f32, f32)>,
     /// If Some, convolve with exponential-decay impulse response of this RT60 (ms).
     pub reverb_rt60_ms: Option<f32>,
-}
-
-impl Default for ChannelCfg {
-    fn default() -> Self {
-        Self {
-            snr_db: None,
-            bandpass: None,
-            reverb_rt60_ms: None,
-        }
-    }
 }
 
 pub fn apply(samples: &[f32], cfg: &ChannelCfg, rng: &mut impl Rng) -> Vec<f32> {
@@ -338,8 +329,8 @@ mod tests {
         let burst_samples = fs / 100; // 10 ms
         let total_samples = fs / 5; // 200 ms
         let mut x = vec![0.0f32; total_samples];
-        for i in 0..burst_samples {
-            x[i] = 0.8 * (std::f32::consts::TAU * 1_000.0 * (i as f32) / (fs as f32)).sin();
+        for (i, sample) in x.iter_mut().enumerate().take(burst_samples) {
+            *sample = 0.8 * (std::f32::consts::TAU * 1_000.0 * (i as f32) / (fs as f32)).sin();
         }
 
         let cfg = ChannelCfg {

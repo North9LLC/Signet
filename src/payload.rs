@@ -13,7 +13,7 @@ pub fn derive_from_drand_signature(sig_hex: &str) -> Result<[u8; 16], String> {
 }
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length: {}", s.len()));
     }
     let nyb = |c: u8| -> Result<u8, String> {

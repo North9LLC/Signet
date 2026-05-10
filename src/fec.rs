@@ -351,7 +351,7 @@ fn poly_mul_mod(a: &[u8], b: &[u8], n: usize) -> Vec<u8> {
 // In GF(2^m), the coefficient of x^i in p'(x) is p[i+1]*(i+1);
 // since char=2, this is p[i+1] when i+1 is odd, else 0.
 fn poly_formal_deriv(p: &[u8]) -> Vec<u8> {
-    let len = if p.len() > 0 { p.len() - 1 } else { 0 };
+    let len = if !p.is_empty() { p.len() - 1 } else { 0 };
     let mut d = vec![0u8; len.max(1)];
     for i in 0..len {
         if (i + 1) % 2 == 1 {

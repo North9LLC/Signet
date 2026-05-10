@@ -66,7 +66,7 @@ pub fn load_or_create_key() -> Result<SigningKey, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
         }
-        fs::write(&path, &seed).map_err(|e| format!("write key: {}", e))?;
+        fs::write(&path, seed).map_err(|e| format!("write key: {}", e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -80,12 +80,12 @@ pub fn load_or_create_key() -> Result<SigningKey, String> {
 
 // ── Device ID ────────────────────────────────────────────────────────────────
 
-/// First 16 bytes of SHA-256(public_key).
-/// 128 bits: collision probability negligible at any realistic device count.
-pub fn device_id(vk: &VerifyingKey) -> [u8; 16] {
+/// First 8 bytes of SHA-256(public_key).
+/// 64 bits: collision probability negligible at any realistic device count.
+pub fn device_id(vk: &VerifyingKey) -> [u8; 8] {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(vk.as_bytes());
-    hash[..16].try_into().unwrap()
+    hash[..8].try_into().unwrap()
 }
 
 // ── Signing ───────────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ pub fn device_id(vk: &VerifyingKey) -> [u8; 16] {
 pub fn sign_stamp(
     key: &SigningKey,
     drand_round: u64,
-    dev_id: &[u8; 16],
+    dev_id: &[u8; 8],
     drand_payload: &[u8; 16],
     pixel_hash: &[u8; 32],
 ) -> [u8; 64] {
@@ -108,7 +108,7 @@ pub fn verify_stamp(
     vk: &VerifyingKey,
     sig_bytes: &[u8; 64],
     drand_round: u64,
-    dev_id: &[u8; 16],
+    dev_id: &[u8; 8],
     drand_payload: &[u8; 16],
     pixel_hash: &[u8; 32],
 ) -> bool {
@@ -119,11 +119,11 @@ pub fn verify_stamp(
 
 fn build_sign_msg(
     drand_round: u64,
-    dev_id: &[u8; 16],
+    dev_id: &[u8; 8],
     drand_payload: &[u8; 16],
     pixel_hash: &[u8; 32],
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(SIGN_DOMAIN.len() + 8 + 16 + 16 + 32);
+    let mut msg = Vec::with_capacity(SIGN_DOMAIN.len() + 8 + 8 + 16 + 32);
     msg.extend_from_slice(SIGN_DOMAIN);
     msg.extend_from_slice(&drand_round.to_le_bytes());
     msg.extend_from_slice(dev_id);
@@ -188,7 +188,7 @@ pub struct TrustLookup {
 }
 
 /// Register a device in the local trusted list (dev mode only).
-pub fn trust_device(dev_id: &[u8; 16], vk: &VerifyingKey) -> Result<(), String> {
+pub fn trust_device(dev_id: &[u8; 8], vk: &VerifyingKey) -> Result<(), String> {
     let mut map = load_trusted_map();
     map.insert(hex(dev_id), hex(vk.as_bytes()));
     let json = serde_json::to_string_pretty(&map)
@@ -203,7 +203,7 @@ pub fn trust_device(dev_id: &[u8; 16], vk: &VerifyingKey) -> Result<(), String> 
 
 /// Look up a device from the remote registry (via SIGNET_REGISTRY_URL env var).
 /// If SIGNET_REGISTRY_URL is unset or the registry is unreachable, returns None.
-pub fn lookup_device(dev_id: &[u8; 16]) -> Option<TrustLookup> {
+pub fn lookup_device(dev_id: &[u8; 8]) -> Option<TrustLookup> {
     let registry_url = std::env::var("SIGNET_REGISTRY_URL")
         .ok()
         .filter(|s| !s.is_empty())?;
@@ -251,7 +251,7 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

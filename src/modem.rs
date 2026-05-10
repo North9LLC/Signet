@@ -138,9 +138,7 @@ pub fn encode(payload: &[u8; PAYLOAD_BYTES]) -> Vec<f32> {
     push_tone(&mut out, &mut phase, FMARK, lead_in_samples);
 
     // 1b. Silence gap so reverb tails from the lead-in decay.
-    for _ in 0..gap_samples {
-        out.push(0.0);
-    }
+    out.extend(std::iter::repeat_n(0.0f32, gap_samples));
     phase = 0.0; // phase reset is fine across a silent gap.
 
     // Build all data bits in one slice so shaping works across section boundaries.
@@ -160,9 +158,7 @@ pub fn encode(payload: &[u8; PAYLOAD_BYTES]) -> Vec<f32> {
     push_bits_shaped(&mut out, &mut phase, &all_bits);
 
     // 6. Trail: silence.
-    for _ in 0..trail_samples {
-        out.push(0.0);
-    }
+    out.extend(std::iter::repeat_n(0.0f32, trail_samples));
 
     out
 }
@@ -386,7 +382,7 @@ mod tests {
 
     #[test]
     fn round_trip_clean() {
-        let mut rng = StdRng::seed_from_u64(0xC0FFEE_BAD_F00D);
+        let mut rng = StdRng::seed_from_u64(0x000C_0FFE_EBAD_F00D);
         for trial in 0..5 {
             let mut payload = [0u8; PAYLOAD_BYTES];
             rng.fill_bytes(&mut payload);

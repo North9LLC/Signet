@@ -49,7 +49,7 @@ pub fn verify_signature(signature_hex: &str, randomness_hex: &str) -> bool {
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
